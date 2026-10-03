@@ -63,10 +63,16 @@
   --grad-success: linear-gradient(135deg, #16a34a 0%, #0891b2 100%);
 }
 
-* { box-sizing: border-box; margin: 0; padding: 0; }
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
 
 html, body {
-  height: 100%;
+  height: 100vh;
+  height: 100dvh;
   background: var(--bg);
   color: var(--text-1);
   font-family: var(--sans);
@@ -78,6 +84,24 @@ html, body {
 
 button { font-family: inherit; }
 
+button, .nav-item, select, input {
+  touch-action: manipulation;
+}
+
+/* Отключаем hover-эффекты на тач-устройствах */
+@media (hover: none) {
+  .nav-item:hover,
+  .btn:hover:not(:disabled),
+  .btn-icon:hover:not(:disabled),
+  .segment:hover,
+  .history-item:hover {
+    background: inherit;
+    border-color: inherit;
+    transform: none;
+  }
+  .segment:hover .gutter { color: var(--text-3); }
+}
+
 /* ============================================================
    App layout
    ============================================================ */
@@ -85,6 +109,7 @@ button { font-family: inherit; }
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
   height: 100vh;
+  height: 100dvh;
   padding-bottom: 44px;
   transition: padding-bottom var(--transition);
 }
@@ -234,6 +259,52 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 .status-pill.err .dot { background: var(--error); }
 
 /* ============================================================
+   Hamburger + mobile overlay
+   ============================================================ */
+.hamburger {
+  display: none;
+  width: 40px;
+  height: 40px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  border-radius: var(--radius);
+  transition: background var(--transition);
+  flex-shrink: 0;
+}
+.hamburger span {
+  display: block;
+  width: 20px;
+  height: 2px;
+  background: var(--text-1);
+  border-radius: 2px;
+  transition: all var(--transition);
+}
+.hamburger:hover { background: var(--bg-2); }
+
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  z-index: 90;
+  opacity: 0;
+  transition: opacity .25s;
+  backdrop-filter: blur(2px);
+}
+.sidebar-overlay.visible {
+  display: block;
+  opacity: 1;
+}
+
+.brand-mobile { display: none; }
+
+/* ============================================================
    Main / Views
    ============================================================ */
 .main {
@@ -241,13 +312,44 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  min-width: 0;
 }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+  min-height: 56px;
+}
+
+.gpu-info {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-dim);
+  background: var(--bg-2);
+  padding: 6px 12px; border-radius: 20px;
+  border: 1px solid var(--border);
+}
+.gpu-info .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-3);
+  transition: background .3s;
+  flex-shrink: 0;
+}
+.gpu-info.ok .dot { background: var(--success); box-shadow: 0 0 8px var(--success); }
+.gpu-info.err .dot { background: var(--error); }
+.gpu-info .text { color: var(--text); font-weight: 500; }
 
 .view {
   display: none;
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  min-height: 0;
 }
 .view.active { display: flex; }
 
@@ -259,19 +361,21 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   border-bottom: 1px solid var(--border);
   background: var(--bg-1);
   flex-shrink: 0;
+  gap: 12px;
 }
 .view-header h1 {
   font-size: 18px;
   font-weight: 700;
   letter-spacing: -.2px;
 }
-.header-actions { display: flex; align-items: center; gap: 10px; }
+.header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 .view-body {
   flex: 1;
   overflow-y: auto;
   padding: 20px 28px;
   min-height: 0;
+  -webkit-overflow-scrolling: touch;
 }
 
 .gpu-pill {
@@ -339,6 +443,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 }
 @media (max-width: 1100px) {
   .layout-2col { grid-template-columns: 1fr; height: auto; }
+  .col-right { min-height: 60vh; }
 }
 
 .col-left, .col-right { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
@@ -430,6 +535,90 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 }
 
 /* ============================================================
+   Custom number input with steppers
+   ============================================================ */
+.num-input {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  background: var(--bg-2);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: all var(--transition);
+  width: 100%;
+}
+.num-input:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.num-input input {
+  flex: 1;
+  min-width: 0;
+  background: transparent !important;
+  border: none !important;
+  padding: 9px 12px;
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  box-shadow: none !important;
+}
+.num-input input::-webkit-outer-spin-button,
+.num-input input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.num-input input {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.num-input .steppers {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border-hi);
+  background: var(--bg-3);
+  flex-shrink: 0;
+  width: 26px;
+}
+.num-input .stepper {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+  padding: 0;
+  font-size: 9px;
+  line-height: 1;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.num-input .stepper:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg);
+}
+.num-input .stepper:active:not(:disabled) {
+  background: var(--accent-2);
+}
+.num-input .stepper:disabled {
+  opacity: .3;
+  cursor: not-allowed;
+}
+.num-input .stepper.up {
+  border-bottom: 1px solid var(--border-hi);
+  font-size: 10px;
+  padding-bottom: 1px;
+}
+.num-input .stepper.down {
+  padding-top: 1px;
+}
+
+/* ============================================================
    Buttons
    ============================================================ */
 .btn {
@@ -448,6 +637,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   gap: 7px;
   transition: all var(--transition);
   white-space: nowrap;
+  min-height: 40px;
 }
 .btn:hover:not(:disabled) { background: var(--bg-3); border-color: var(--accent); }
 .btn:active:not(:disabled) { transform: scale(.98); }
@@ -480,8 +670,8 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 .btn-lg { padding: 12px 22px; font-size: 14px; }
 
 .btn-icon {
-  width: 34px;
-  height: 34px;
+  width: 40px;
+  height: 40px;
   padding: 0;
   border-radius: var(--radius);
   background: transparent;
@@ -493,6 +683,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 .btn-icon:hover:not(:disabled) { color: var(--text); border-color: var(--accent); background: var(--bg-2); }
 .btn-icon:disabled { opacity: .35; cursor: not-allowed; }
@@ -584,6 +775,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   overflow-y: auto;
   padding: 8px 0;
   min-height: 0;
+  -webkit-overflow-scrolling: touch;
 }
 
 .empty-state {
@@ -595,7 +787,6 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 .empty-text { font-size: 14px; font-weight: 500; color: var(--text-2); }
 .empty-hint { font-size: 12px; margin-top: 6px; opacity: .8; }
 
-/* Segments с "номерами строк" */
 .segments { font-family: var(--mono); font-size: 13px; line-height: 1.65; }
 
 .segment {
@@ -628,12 +819,73 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   color: var(--text-1);
   word-break: break-word;
   white-space: pre-wrap;
+  min-width: 0;
 }
 
 .segment.new-segment { animation: segmentIn .3s ease; }
 @keyframes segmentIn {
   from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: none; }
+}
+
+/* ============================================================
+   Scroll-to-bottom button (floating)
+   ============================================================ */
+.scroll-bottom-btn {
+  position: absolute;
+  bottom: 20px;
+  right: 24px;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  padding: 8px 14px 8px 12px;
+  border-radius: 24px;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: inherit;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0,0,0,.35),
+              0 0 0 1px color-mix(in srgb, var(--bg) 20%, transparent);
+  z-index: 5;
+  transition: transform var(--transition), background var(--transition);
+}
+.scroll-bottom-btn.visible {
+  display: inline-flex;
+  animation: scrollBtnIn .25s cubic-bezier(.4,0,.2,1);
+}
+.scroll-bottom-btn:hover {
+  background: var(--accent-2);
+  transform: translateY(-2px);
+}
+.scroll-bottom-btn:active { transform: translateY(0) scale(.97); }
+
+.scroll-bottom-btn .arrow {
+  font-size: 14px;
+  line-height: 1;
+  animation: bounceDown 1.6s ease-in-out infinite;
+}
+.scroll-bottom-btn .label { letter-spacing: .2px; }
+.scroll-bottom-btn .badge {
+  background: var(--bg);
+  color: var(--accent);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 800;
+  min-width: 20px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes scrollBtnIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes bounceDown {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(3px); }
 }
 
 /* ============================================================
@@ -667,6 +919,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 .history-status {
   font-size: 10px; font-weight: 700; padding: 3px 8px;
   border-radius: 20px; text-transform: uppercase; letter-spacing: .5px;
+  flex-shrink: 0;
 }
 .history-status.done      { background: color-mix(in srgb, var(--success) 20%, transparent); color: var(--success); }
 .history-status.error     { background: color-mix(in srgb, var(--error) 20%, transparent); color: var(--error); }
@@ -736,6 +989,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   margin-top: 10px;
   height: 28px;
   width: 100%;
+  color: var(--accent);
 }
 
 .disks-list { display: flex; flex-direction: column; gap: 12px; }
@@ -746,8 +1000,8 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
   background: var(--bg-2);
 }
 .disk-label { font-weight: 600; font-size: 13px; min-width: 80px; }
-.disk-path  { font-family: var(--mono); font-size: 11px; color: var(--text-3); flex: 1; }
-.disk-bar   { flex: 2; height: 6px; background: var(--bg-3); border-radius: 6px; overflow: hidden; }
+.disk-path  { font-family: var(--mono); font-size: 11px; color: var(--text-3); flex: 1; word-break: break-all; }
+.disk-bar   { flex: 2; height: 6px; background: var(--bg-3); border-radius: 6px; overflow: hidden; min-width: 60px; }
 .disk-bar-fill { height: 100%; background: var(--grad-primary); border-radius: 6px; }
 .disk-info  { font-size: 11px; color: var(--text-3); font-family: var(--mono); }
 
@@ -804,6 +1058,7 @@ body.console-open .app { padding-bottom: min(340px, 45vh); }
 }
 .settings-field.toggle input[type="checkbox"] {
   width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer;
+  flex-shrink: 0;
 }
 
 /* ============================================================
@@ -863,6 +1118,7 @@ body.console-open .console { transform: translateY(0); }
   font-size: 12px;
   line-height: 1.55;
   background: var(--bg);
+  -webkit-overflow-scrolling: touch;
 }
 .console-empty {
   padding: 40px;
@@ -897,7 +1153,7 @@ body.console-open .console { transform: translateY(0); }
 .log-level.warn    { color: var(--warn); }
 .log-level.error   { color: var(--error); }
 .log-level.debug   { color: var(--text-3); }
-.log-message { color: var(--text-1); white-space: pre-wrap; word-break: break-word; flex: 1; }
+.log-message { color: var(--text-1); white-space: pre-wrap; word-break: break-word; flex: 1; min-width: 0; }
 
 /* ============================================================
    Toasts
@@ -908,6 +1164,7 @@ body.console-open .console { transform: translateY(0); }
   display: flex; flex-direction: column; gap: 10px;
   z-index: 9999;
   pointer-events: none;
+  max-width: calc(100vw - 40px);
 }
 .toast {
   pointer-events: auto;
@@ -925,7 +1182,7 @@ body.console-open .console { transform: translateY(0); }
 }
 .toast.hide { opacity: 0; transform: translateX(20px); }
 .toast .toast-icon { font-size: 16px; flex-shrink: 0; }
-.toast .toast-text { flex: 1; color: var(--text-1); }
+.toast .toast-text { flex: 1; color: var(--text-1); min-width: 0; word-break: break-word; }
 .toast.success { border-left-color: var(--success); }
 .toast.error   { border-left-color: var(--error); }
 .toast.warn    { border-left-color: var(--warn); }
@@ -951,69 +1208,286 @@ body.console-open .console { transform: translateY(0); }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-3); background-clip: padding-box; }
 
 /* ============================================================
-   Scroll-to-bottom button (floating)
+   Adaptive: планшет/крупный телефон ≤ 900px — drawer
    ============================================================ */
-.scroll-bottom-btn {
-  position: absolute;
-  bottom: 20px;
-  right: 24px;
-  background: var(--accent);
-  color: var(--bg);
-  border: none;
-  padding: 8px 14px 8px 12px;
-  border-radius: 24px;
-  font-size: 12px;
-  font-weight: 700;
-  font-family: inherit;
-  display: none;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  box-shadow: 0 6px 20px rgba(0,0,0,.35), 0 0 0 1px color-mix(in srgb, var(--bg) 20%, transparent);
-  animation: scrollBtnIn .25s cubic-bezier(.4,0,.2,1);
-  z-index: 5;
-  transition: transform var(--transition), background var(--transition);
+@media (max-width: 900px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    width: 280px;
+    max-width: 85vw;
+    transform: translateX(-100%);
+    transition: transform .28s cubic-bezier(.4,0,.2,1);
+    z-index: 100;
+    box-shadow: 4px 0 24px rgba(0,0,0,.35);
+  }
+  .app.sidebar-open .sidebar {
+    transform: translateX(0);
+  }
+
+  .hamburger { display: flex; }
+
+  .topbar {
+    padding: 10px 16px;
+    gap: 12px;
+    justify-content: flex-start;
+  }
+  .brand-mobile {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--accent);
+    margin-right: auto;
+  }
+
+  .gpu-info { font-size: 11px; padding: 5px 10px; }
+  .gpu-info .text {
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .view-header { padding: 14px 16px; }
+  .view-header h1 { font-size: 16px; }
+
+  .view-body { padding: 14px 16px; }
+
+  .card { padding: 16px; border-radius: var(--radius); }
+  .card-header { margin-bottom: 12px; }
+
+  .dropzone { padding: 28px 16px; }
+  .dropzone-icon { font-size: 34px; margin-bottom: 8px; }
+  .dropzone-title { font-size: 14px; }
+
+  .quick-options {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .actions { flex-direction: column; }
+  .actions .btn { width: 100%; }
+
+  .metrics-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .metric-value { font-size: 18px; }
+
+  .settings-form { max-width: 100%; }
+  .settings-group-body { padding: 14px 16px; gap: 14px; }
+
+  .history-item {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .history-main { min-width: 100%; order: 2; }
+  .history-meta { font-size: 10px; }
+
+  .console {
+    height: 60vh;
+    max-height: 480px;
+  }
+  body.console-open .app {
+    padding-bottom: 60vh;
+  }
 }
 
-.scroll-bottom-btn.visible {
-  display: inline-flex;
-  animation: scrollBtnIn .25s cubic-bezier(.4,0,.2,1);
+/* ============================================================
+   Adaptive: телефон ≤ 600px — компактная вёрстка
+   ============================================================ */
+@media (max-width: 600px) {
+  html, body { font-size: 14px; }
+
+  .app { padding-bottom: 48px; }
+  body.console-open .app { padding-bottom: 55vh; }
+
+  .topbar { padding: 8px 12px; }
+  .gpu-info .text { max-width: 100px; }
+
+  .view-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+  .view-header .header-actions { width: 100%; justify-content: flex-end; }
+
+  .view-body { padding: 12px 14px; }
+
+  .card { padding: 14px; }
+
+  .dropzone { padding: 22px 12px; }
+  .dropzone-icon { font-size: 30px; }
+  .dropzone-formats { font-size: 10px; }
+
+  .quick-options {
+    grid-template-columns: 1fr;
+  }
+
+  .actions .btn-lg {
+    padding: 14px 18px;
+    font-size: 15px;
+  }
+
+  .progress-header .stage { font-size: 11px; }
+  .progress-header .pct { font-size: 13px; }
+  .progress-msg { font-size: 11px; }
+
+  .segments { font-size: 14px; line-height: 1.6; }
+  .gutter {
+    min-width: 54px;
+    padding: 0 8px 0 12px;
+    font-size: 10px;
+    margin-right: 8px;
+  }
+  .segment .text { padding-right: 12px; }
+
+  .result-card { min-height: 50vh; }
+
+  .metrics-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .metric-card { padding: 14px; }
+  .metric-value { font-size: 20px; }
+
+  .sparkline { height: 22px; }
+
+  .disk-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .disk-label { min-width: auto; }
+  .disk-path { font-size: 10px; }
+  .disk-bar { width: 100%; }
+
+  .settings-group-header { padding: 12px 14px; font-size: 11px; }
+  .settings-group-body { padding: 12px 14px; gap: 12px; }
+  .settings-field label { font-size: 12px; }
+  .settings-field input,
+  .settings-field select { font-size: 14px; padding: 10px 12px; }
+
+  .history-item { padding: 12px; }
+  .history-icon { width: 34px; height: 34px; font-size: 16px; }
+  .history-name { font-size: 13px; }
+  .history-status { font-size: 9px; padding: 2px 6px; }
+
+  .toasts {
+    top: auto;
+    bottom: 16px;
+    left: 12px;
+    right: 12px;
+    align-items: stretch;
+  }
+  .toast {
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+    animation: toastInMobile .3s cubic-bezier(.4,0,.2,1);
+  }
+  .toast.hide { transform: translateY(20px); }
+  @keyframes toastInMobile {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  .console {
+    height: 55vh;
+    max-height: none;
+  }
+  .console-header { padding: 0 14px; height: 42px; }
+  .console-title { font-size: 11px; }
+  .console-body { font-size: 11px; }
+  .log-line { padding: 2px 14px; gap: 8px; }
+  .log-time { min-width: 52px; font-size: 10px; }
+  .log-level { min-width: 46px; font-size: 9px; }
+  .console-actions .btn-mini { padding: 6px 8px; font-size: 10px; }
+
+  .scroll-bottom-btn {
+    bottom: 16px;
+    right: 16px;
+    padding: 10px 14px;
+    font-size: 12px;
+  }
 }
 
-.scroll-bottom-btn:hover {
-  background: var(--accent-2);
-  transform: translateY(-2px);
-}
-.scroll-bottom-btn:active { transform: translateY(0) scale(.97); }
-
-.scroll-bottom-btn .arrow {
-  font-size: 14px;
-  line-height: 1;
-  animation: bounceDown 1.6s ease-in-out infinite;
+/* ============================================================
+   Adaptive: очень узкие экраны ≤ 380px
+   ============================================================ */
+@media (max-width: 380px) {
+  .gpu-info { display: none; }
+  .brand-mobile { font-size: 13px; }
+  .dropzone-formats { display: none; }
+  .quick-options { gap: 6px; }
 }
 
-.scroll-bottom-btn .label {
-  letter-spacing: .2px;
+/* ============================================================
+   Fix: предотвращение горизонтального overflow на мобильных
+   ============================================================ */
+
+/* Все grid/flex-контейнеры в цепочке layout должны уметь сжиматься
+   меньше своего содержимого. Без min-width: 0 они раздувают .main
+   шире экрана, и body{overflow:hidden} просто обрезает правый край. */
+.app,
+.main,
+.view,
+.view-body,
+.layout-2col,
+.col-left,
+.col-right,
+.card,
+.result-card,
+.settings-form,
+.settings-group {
+  min-width: 0;
 }
 
-.scroll-bottom-btn .badge {
-  background: var(--bg);
-  color: var(--accent);
-  padding: 1px 7px;
-  border-radius: 10px;
-  font-size: 10px;
-  font-weight: 800;
-  min-width: 20px;
-  text-align: center;
-  font-variant-numeric: tabular-nums;
+/* Страховка: даже если внутри что-то окажется шире, оно не потянет
+   за собой всю страницу, а будет обрезано/сжато внутри секции. */
+.view-body {
+  overflow-x: hidden;
+  max-width: 100%;
 }
 
-@keyframes scrollBtnIn {
-  from { opacity: 0; transform: translateY(10px); }
-  to   { opacity: 1; transform: none; }
+/* GPU-pill в шапке view — обрезаем длинный текст эллипсисом,
+   а не даём ему раздувать .header-actions. */
+.gpu-pill {
+  max-width: 100%;
+  min-width: 0;
+}
+.gpu-pill .text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
-@keyframes bounceDown {
-  0%, 100% { transform: translateY(0); }
-  50%      { transform: translateY(3px); }
+/* Верхний topbar: то же самое для gpu-info */
+.topbar { min-width: 0; }
+.gpu-info {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Кнопки с white-space: nowrap не должны переполнять карточки */
+.card .btn,
+.actions .btn {
+  max-width: 100%;
+}
+
+/* Внутри карточек длинные строки переносятся, а не растягивают родителя */
+.history-meta,
+.progress-msg,
+.metric-sub,
+.disk-path,
+.disk-info {
+  overflow-wrap: anywhere;
 }

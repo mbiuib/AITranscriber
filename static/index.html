@@ -2,16 +2,17 @@
 <html lang="ru" data-theme="dark">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f17">
 <title>Whisper Transcriber</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
-<div class="app">
+<div class="app" id="app">
 
   <!-- ============ Sidebar ============ -->
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="brand">
       <span class="brand-logo">🎙️</span>
       <div class="brand-text">
@@ -53,8 +54,22 @@
     </div>
   </aside>
 
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
   <!-- ============ Main ============ -->
   <main class="main">
+
+    <!-- ---- Topbar ---- -->
+    <header class="topbar">
+      <button class="hamburger" id="hamburger" aria-label="Меню">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="brand-mobile">🎙️ Whisper</div>
+      <div class="gpu-info" id="gpu-info">
+        <span class="dot"></span>
+        <span class="text">…</span>
+      </div>
+    </header>
 
     <!-- ---- View: New ---- -->
     <section class="view active" data-view="new">
@@ -71,7 +86,6 @@
       <div class="view-body">
         <div class="layout-2col">
 
-          <!-- Left: upload + controls -->
           <div class="col-left">
             <div class="card">
               <div class="dropzone" id="dropzone">
@@ -118,7 +132,6 @@
             </div>
           </div>
 
-          <!-- Right: result -->
           <div class="col-right">
             <div class="card result-card">
               <div class="card-header">
@@ -138,6 +151,7 @@
                   <div class="empty-hint" data-i18n="result.empty_hint">Загрузите файл и начните</div>
                 </div>
               </div>
+
               <button class="scroll-bottom-btn" id="scroll-bottom-btn">
                 <span class="arrow">↓</span>
                 <span class="label" data-i18n="result.new_segments">Новые сегменты</span>

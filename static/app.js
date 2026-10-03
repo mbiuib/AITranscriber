@@ -1,14 +1,15 @@
 /* ============================================================
-   Whisper Transcriber — Enterprise UI
+   Whisper Transcriber — клиентская логика
    ============================================================ */
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 
-// ============================================================
-// State
-// ============================================================
 const ACTIVE_JOB_KEY = "whisper_active_job_id";
+
+/* ============================================================
+   State
+   ============================================================ */
 const state = {
   file: null,
   jobId: null,
@@ -30,9 +31,9 @@ const state = {
   seenSegmentsCount: 0,
 };
 
-// ============================================================
-// i18n
-// ============================================================
+/* ============================================================
+   i18n
+   ============================================================ */
 async function loadLocales() {
   const r = await fetch("/api/locales");
   const data = await r.json();
@@ -41,7 +42,6 @@ async function loadLocales() {
   const rr = await fetch(`/api/locales/${state.lang}`);
   state.i18n = await rr.json();
 
-  // Кнопки языков
   const sw = $("#lang-switch");
   sw.innerHTML = "";
   for (const code of data.available) {
@@ -80,9 +80,9 @@ function applyI18n() {
   });
 }
 
-// ============================================================
-// Theme
-// ============================================================
+/* ============================================================
+   Theme
+   ============================================================ */
 async function setTheme(theme) {
   state.theme = theme;
   document.documentElement.dataset.theme = theme;
@@ -96,9 +96,9 @@ async function setTheme(theme) {
   });
 }
 
-// ============================================================
-// Toasts
-// ============================================================
+/* ============================================================
+   Toasts
+   ============================================================ */
 function toast(kind, icon, text, timeout = 3500) {
   const el = document.createElement("div");
   el.className = "toast " + kind;
@@ -111,9 +111,9 @@ function toast(kind, icon, text, timeout = 3500) {
   }, timeout);
 }
 
-// ============================================================
-// System info / GPU
-// ============================================================
+/* ============================================================
+   System info / GPU
+   ============================================================ */
 async function loadSystem() {
   try {
     const r = await fetch("/api/system/resources");
@@ -137,9 +137,9 @@ async function loadSystem() {
   }
 }
 
-// ============================================================
-// Settings
-// ============================================================
+/* ============================================================
+   Settings
+   ============================================================ */
 async function loadSettings() {
   const [sr, schr] = await Promise.all([
     fetch("/api/settings").then(r => r.json()),
@@ -156,7 +156,6 @@ function renderSettingsForm() {
   const form = $("#settings-form");
   form.innerHTML = "";
 
-  // Группируем по group
   const groups = {};
   for (const [key, def] of Object.entries(state.schema)) {
     const g = def.group || "misc";
@@ -205,6 +204,20 @@ function renderField(key, def) {
     lbl.htmlFor = cb.id;
     lbl.textContent = def.label || key;
     wrap.append(cb, lbl);
+  } else if (def.type === "int") {
+    const lbl = document.createElement("label");
+    lbl.textContent = def.label || key;
+    wrap.appendChild(lbl);
+
+    const numWrap = createNumberInput(val ?? 0, {
+      min: def.min,
+      max: def.max,
+      id: `set-${key}`,
+      onChange: (v) => {
+        state.settingsDirty[key] = v;
+      },
+    });
+    wrap.appendChild(numWrap);
   } else {
     const lbl = document.createElement("label");
     lbl.textContent = def.label || key;
@@ -219,12 +232,6 @@ function renderField(key, def) {
         if (opt === val) o.selected = true;
         inp.appendChild(o);
       }
-    } else if (def.type === "int") {
-      inp = document.createElement("input");
-      inp.type = "number";
-      if (def.min != null) inp.min = def.min;
-      if (def.max != null) inp.max = def.max;
-      inp.value = val ?? "";
     } else {
       inp = document.createElement("input");
       inp.type = "text";
@@ -232,9 +239,7 @@ function renderField(key, def) {
     }
     inp.id = `set-${key}`;
     inp.addEventListener("input", () => {
-      state.settingsDirty[key] = def.type === "int"
-        ? parseInt(inp.value, 10)
-        : inp.value;
+      state.settingsDirty[key] = inp.value;
     });
     wrap.appendChild(inp);
   }
@@ -260,6 +265,7 @@ function applyQuickOptions() {
     if (m === state.settings["transcription.model"]) o.selected = true;
     modelSel.appendChild(o);
   }
+
   const langSel = document.createElement("select");
   for (const l of state.schema["transcription.language"].options) {
     const o = document.createElement("option");
@@ -268,16 +274,21 @@ function applyQuickOptions() {
     if (l === state.settings["transcription.language"]) o.selected = true;
     langSel.appendChild(o);
   }
-  const bsInput = document.createElement("input");
-  bsInput.type = "number";
-  bsInput.min = 1; bsInput.max = 32;
-  bsInput.value = state.settings["transcription.batch_size"];
+
+  const bsInput = createNumberInput(
+    state.settings["transcription.batch_size"],
+    { min: 1, max: 32, step: 1 }
+  );
 
   q.appendChild(wrapField(t("field.model"), modelSel));
   q.appendChild(wrapField(t("field.language"), langSel));
   q.appendChild(wrapField(t("field.batch_size"), bsInput));
 
-  state.quickRefs = { modelSel, langSel, bsInput };
+  state.quickRefs = {
+    modelSel,
+    langSel,
+    getBatchSize: () => bsInput.getValue(),
+  };
 }
 
 function wrapField(label, input) {
@@ -288,6 +299,71 @@ function wrapField(label, input) {
   l.textContent = label;
   d.append(l, input);
   return d;
+}
+
+/**
+ * Создаёт <input type="number"> с кастомными стрелками.
+ * Возвращает контейнер с публичным API: getValue(), setValue(), input.
+ */
+function createNumberInput(value, { min, max, step = 1, id, onChange } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = "num-input";
+
+  const input = document.createElement("input");
+  input.type = "number";
+  input.value = value ?? "";
+  if (min != null) input.min = min;
+  if (max != null) input.max = max;
+  input.step = step;
+  if (id) input.id = id;
+
+  const steppers = document.createElement("div");
+  steppers.className = "steppers";
+
+  const up = document.createElement("button");
+  up.type = "button";
+  up.className = "stepper up";
+  up.textContent = "▲";
+  up.tabIndex = -1;
+
+  const down = document.createElement("button");
+  down.type = "button";
+  down.className = "stepper down";
+  down.textContent = "▼";
+  down.tabIndex = -1;
+
+  const clamp = (v) => {
+    if (min != null && v < min) v = min;
+    if (max != null && v > max) v = max;
+    return v;
+  };
+
+  up.addEventListener("click", () => {
+    const v = clamp((parseInt(input.value, 10) || 0) + step);
+    input.value = v;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    onChange?.(v);
+  });
+
+  down.addEventListener("click", () => {
+    const v = clamp((parseInt(input.value, 10) || 0) - step);
+    input.value = v;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    onChange?.(v);
+  });
+
+  input.addEventListener("input", () => {
+    onChange?.(parseInt(input.value, 10));
+  });
+
+  steppers.append(up, down);
+  wrap.append(input, steppers);
+
+  wrap.getValue = () => parseInt(input.value, 10);
+  wrap.setValue = (v) => { input.value = clamp(v); };
+  wrap.input = input;
+
+  return wrap;
 }
 
 async function saveSettings() {
@@ -325,9 +401,85 @@ async function resetSettings() {
   toast("success", "🔄", t("toast.settings_reset"));
 }
 
-// ============================================================
-// Jobs / upload
-// ============================================================
+/* ============================================================
+   Active job persistence (переживание F5)
+   ============================================================ */
+function saveActiveJob(jobId) {
+  try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch {}
+}
+function clearActiveJob() {
+  try { localStorage.removeItem(ACTIVE_JOB_KEY); } catch {}
+}
+function getSavedJobId() {
+  try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; }
+}
+
+/**
+ * Восстанавливает активную задачу после перезагрузки страницы.
+ */
+async function restoreActiveJob() {
+  let jobId = getSavedJobId();
+
+  if (!jobId) {
+    try {
+      const r = await fetch("/api/jobs");
+      const d = await r.json();
+      const active = (d.jobs || []).find(j =>
+        ["pending", "downloading", "loading", "transcribing"].includes(j.status)
+      );
+      if (active) jobId = active.id;
+    } catch {}
+  }
+
+  if (!jobId) return;
+
+  let snap;
+  try {
+    const r = await fetch(`/api/jobs/${jobId}`);
+    if (r.status === 404) {
+      clearActiveJob();
+      return;
+    }
+    if (!r.ok) return;
+    snap = await r.json();
+  } catch {
+    return;
+  }
+
+  applySnapshot(snap);
+  saveActiveJob(snap.id);
+  state.jobId = snap.id;
+
+  const isActive = ["pending", "downloading", "loading", "transcribing"]
+    .includes(snap.status);
+
+  $("#chip-name").textContent = snap.filename;
+  $("#chip-size").textContent = formatSize(snap.file_size || 0);
+  $("#file-chip").hidden = false;
+  $("#chip-remove").style.display = "none";
+
+  if (isActive) {
+    state.running = true;
+    $("#start-btn").disabled = true;
+    $("#cancel-btn").disabled = false;
+    ensureConsoleOpen();
+    subscribe(snap.id);
+    toast("info", "🔄", "Восстановлено: задача выполняется");
+  } else {
+    if (snap.status === "done") {
+      toast("success", "✅", "Восстановлен результат");
+    } else if (snap.status === "error") {
+      toast("error", "❌", "Задача завершилась с ошибкой");
+    } else if (snap.status === "cancelled") {
+      toast("warn", "⏹", "Задача была отменена");
+    }
+    clearActiveJob();
+  }
+}
+
+/* ============================================================
+   Dropzone
+   ============================================================ */
 function setupDropzone() {
   const dz = $("#dropzone");
   const input = $("#file-input");
@@ -379,6 +531,9 @@ function formatSize(bytes) {
   return n.toFixed(1) + " " + u[i];
 }
 
+/* ============================================================
+   Start / cancel
+   ============================================================ */
 async function start() {
   if (!state.file || state.running) return;
   resetResult();
@@ -398,8 +553,8 @@ async function start() {
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const d = await r.json();
     state.jobId = d.job_id;
-    toast("success", "✅", t("toast.job_created"));
     saveActiveJob(d.job_id);
+    toast("success", "✅", t("toast.job_created"));
     subscribe(d.job_id);
     refreshHistory();
   } catch (e) {
@@ -416,6 +571,9 @@ async function cancelJob() {
   toast("warn", "⏹", t("toast.cancelled"));
 }
 
+/* ============================================================
+   SSE
+   ============================================================ */
 function subscribe(jobId) {
   if (state.es) state.es.close();
   const es = new EventSource(`/api/jobs/${jobId}/stream`);
@@ -425,85 +583,6 @@ function subscribe(jobId) {
     catch (e) { console.error(e); }
   };
   es.onerror = () => { if (!state.running) es.close(); };
-}
-
-function saveActiveJob(jobId) {
-  try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch {}
-}
-
-function clearActiveJob() {
-  try { localStorage.removeItem(ACTIVE_JOB_KEY); } catch {}
-}
-
-function getSavedJobId() {
-  try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; }
-}
-
-async function restoreActiveJob() {
-  let jobId = getSavedJobId();
-
-  if (!jobId) {
-    try {
-      const r = await fetch("/api/jobs");
-      const d = await r.json();
-      const active = (d.jobs || []).find(j =>
-        ["pending", "downloading", "loading", "transcribing"].includes(j.status)
-      );
-      if (active) jobId = active.id;
-    } catch {}
-  }
-
-  if (!jobId) return;
-
-  let snap;
-  try {
-    const r = await fetch(`/api/jobs/${jobId}`);
-    if (r.status === 404) {
-      clearActiveJob();
-      return;
-    }
-    if (!r.ok) return;
-    snap = await r.json();
-  } catch {
-    return;
-  }
-
-  applySnapshot(snap);
-  saveActiveJob(snap.id);
-  state.jobId = snap.id;
-
-  const isActive = ["pending", "downloading", "loading", "transcribing"]
-    .includes(snap.status);
-
-  if (isActive) {
-    state.running = true;
-    $("#start-btn").disabled = true;
-    $("#cancel-btn").disabled = false;
-    ensureConsoleOpen();
-
-    $("#chip-name").textContent = snap.filename;
-    $("#chip-size").textContent = formatSize(snap.file_size || 0);
-    $("#file-chip").hidden = false;
-    $("#chip-remove").style.display = "none";
-
-    subscribe(snap.id);
-
-    toast("info", "🔄", "Восстановлено: задача выполняется");
-  } else {
-    $("#chip-name").textContent = snap.filename;
-    $("#chip-size").textContent = formatSize(snap.file_size || 0);
-    $("#file-chip").hidden = false;
-    $("#chip-remove").style.display = "none";
-
-    if (snap.status === "done") {
-      toast("success", "✅", "Восстановлен результат");
-    } else if (snap.status === "error") {
-      toast("error", "❌", "Задача завершилась с ошибкой");
-    } else if (snap.status === "cancelled") {
-      toast("warn", "⏹", "Задача была отменена");
-    }
-    clearActiveJob();
-  }
 }
 
 function handleEvent(ev) {
@@ -525,23 +604,20 @@ function applySnapshot(snap) {
   if (snap.segments?.length) {
     state.segments = [];
     state.seenSegmentsCount = 0;
-    $("#result-content").innerHTML =
-      '<div class="segments" id="segments"></div>';
+    $("#result-content").innerHTML = '<div class="segments" id="segments"></div>';
     for (const s of snap.segments) appendSegment(s, true);
     state.seenSegmentsCount = state.segments.length;
     updateScrollButton();
   }
 
-  if (snap.progress !== undefined) {
-    updateProgress(snap.progress, snap.message, snap.stage);
-  }
+  if (snap.progress !== undefined) updateProgress(snap.progress, snap.message, snap.stage);
   updateStatus(snap.status, snap.message);
-
-  if (snap.status === "done") {
-    onDone(snap.text, snap.metadata);
-  }
+  if (snap.status === "done") onDone(snap.text, snap.metadata);
 }
 
+/* ============================================================
+   Progress
+   ============================================================ */
 function updateProgress(v, msg, stage) {
   const fill = $("#progress-fill");
   fill.style.width = v + "%";
@@ -559,6 +635,9 @@ function updateStatus(status, message) {
   }
 }
 
+/* ============================================================
+   Logs
+   ============================================================ */
 function appendLog(entry, silent = false) {
   const body = $("#console-body");
   body.querySelector(".console-empty")?.remove();
@@ -582,6 +661,25 @@ function appendLog(entry, silent = false) {
 
   state.logCount = body.querySelectorAll(".log-line").length;
   $("#console-counter").textContent = state.logCount;
+}
+
+/* ============================================================
+   Segments
+   ============================================================ */
+function isNearBottom(el, threshold = 60) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+}
+
+function updateScrollButton() {
+  const btn = $("#scroll-bottom-btn");
+  if (!btn) return;
+  const unread = state.segments.length - state.seenSegmentsCount;
+  if (unread > 0 && state.running) {
+    btn.classList.add("visible");
+    $("#scroll-bottom-badge").textContent = unread > 99 ? "99+" : unread;
+  } else {
+    btn.classList.remove("visible");
+  }
 }
 
 function appendSegment(seg, silent = false) {
@@ -609,40 +707,18 @@ function appendSegment(seg, silent = false) {
   state.segments.push(seg);
 
   if (silent) {
-    // Восстановление из snapshot — считаем, что всё просмотрено
     state.seenSegmentsCount = state.segments.length;
     rc.scrollTop = rc.scrollHeight;
   } else if (wasAtBottom) {
-    // Пользователь внизу — сразу помечаем новый сегмент как просмотренный
     state.seenSegmentsCount = state.segments.length;
     rc.scrollTop = rc.scrollHeight;
   }
-  // Если пользователь не внизу — просто не трогаем скролл
-  // и не увеличиваем seenSegmentsCount
 
   updateScrollButton();
 
   ["act-copy", "act-txt", "act-srt", "act-json"].forEach(id => {
     $("#" + id).disabled = false;
   });
-}
-
-function isNearBottom(el, threshold = 60) {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
-}
-
-function updateScrollButton() {
-  const btn = $("#scroll-bottom-btn");
-  if (!btn) return;
-
-  const unread = state.segments.length - state.seenSegmentsCount;
-
-  if (unread > 0 && state.running) {
-    btn.classList.add("visible");
-    $("#scroll-bottom-badge").textContent = unread > 99 ? "99+" : unread;
-  } else {
-    btn.classList.remove("visible");
-  }
 }
 
 function formatTs(sec) {
@@ -654,6 +730,27 @@ function formatTs(sec) {
 }
 const pad = (n, l) => String(n).padStart(l, "0");
 
+function setupResultScroll() {
+  const rc = $("#result-content");
+  const btn = $("#scroll-bottom-btn");
+
+  rc.addEventListener("scroll", () => {
+    if (isNearBottom(rc)) {
+      state.seenSegmentsCount = state.segments.length;
+    }
+    updateScrollButton();
+  }, { passive: true });
+
+  btn.addEventListener("click", () => {
+    rc.scrollTo({ top: rc.scrollHeight, behavior: "smooth" });
+    state.seenSegmentsCount = state.segments.length;
+    setTimeout(updateScrollButton, 350);
+  });
+}
+
+/* ============================================================
+   Finish / error
+   ============================================================ */
 function onDone(text, metadata) {
   state.text = text || "";
   state.metadata = metadata || {};
@@ -679,6 +776,7 @@ function onDone(text, metadata) {
   });
 
   toast("success", "🎉", t("toast.done"));
+  if (navigator.vibrate) navigator.vibrate([50, 30, 50]);
   state.es?.close();
   refreshHistory();
 }
@@ -690,6 +788,7 @@ function onError(msg) {
   $("#cancel-btn").disabled = true;
   $("#progress-fill").classList.remove("active");
   toast("error", "❌", msg.slice(0, 140), 6000);
+  if (navigator.vibrate) navigator.vibrate(100);
   state.es?.close();
   refreshHistory();
 }
@@ -702,25 +801,6 @@ function onCancelled() {
   $("#progress-fill").classList.remove("active");
   toast("warn", "⏹", t("toast.cancelled"));
   state.es?.close();
-}
-
-function setupResultScroll() {
-  const rc = $("#result-content");
-  const btn = $("#scroll-bottom-btn");
-
-  rc.addEventListener("scroll", () => {
-    if (isNearBottom(rc)) {
-      // Дошёл до низа — всё считается просмотренным
-      state.seenSegmentsCount = state.segments.length;
-    }
-    updateScrollButton();
-  }, { passive: true });
-
-  btn.addEventListener("click", () => {
-    rc.scrollTo({ top: rc.scrollHeight, behavior: "smooth" });
-    state.seenSegmentsCount = state.segments.length;
-    setTimeout(updateScrollButton, 350);
-  });
 }
 
 function resetResult() {
@@ -744,9 +824,9 @@ function resetResult() {
   state.es?.close();
 }
 
-// ============================================================
-// Export
-// ============================================================
+/* ============================================================
+   Export
+   ============================================================ */
 async function copyText() {
   if (!state.segments.length) return;
   const txt = state.segments.map(s => s.text).join("\n");
@@ -796,9 +876,9 @@ function downloadBlob(content, name, mime) {
   toast("success", "💾", t("toast.saved", { name }));
 }
 
-// ============================================================
-// History
-// ============================================================
+/* ============================================================
+   History
+   ============================================================ */
 async function refreshHistory() {
   try {
     const r = await fetch("/api/jobs");
@@ -851,16 +931,15 @@ function renderHistory() {
   }
 }
 
-// ============================================================
-// System view
-// ============================================================
+/* ============================================================
+   System view
+   ============================================================ */
 async function updateMonitor() {
   const r = await fetch("/api/system/resources");
   const d = await r.json();
   const grid = $("#metrics-grid");
   const html = [];
 
-  // CPU
   const cpu = d.cpu;
   html.push(metricCard(
     t("system.cpu"),
@@ -870,7 +949,6 @@ async function updateMonitor() {
     d.history.cpu
   ));
 
-  // RAM
   const ram = d.ram;
   html.push(metricCard(
     t("system.ram"),
@@ -880,7 +958,6 @@ async function updateMonitor() {
     d.history.ram
   ));
 
-  // GPU
   if (d.gpu) {
     html.push(metricCard(
       t("system.gpu"),
@@ -901,7 +978,6 @@ async function updateMonitor() {
 
   grid.innerHTML = html.join("");
 
-  // Disks
   const dl = $("#disks-list");
   dl.innerHTML = (d.disks || []).map(disk => `
     <div class="disk-item">
@@ -912,7 +988,6 @@ async function updateMonitor() {
     </div>
   `).join("");
 
-  // Update GPU pill
   const pill = $("#gpu-pill");
   if (d.gpu) {
     pill.classList.add("ok"); pill.classList.remove("err");
@@ -944,14 +1019,13 @@ function renderSparkline(data) {
   const step = w / Math.max(data.length - 1, 1);
   const pts = data.map((v, i) => `${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`).join(" ");
   return `<svg class="sparkline" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-    <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5"
-      style="color: var(--accent)"/>
+    <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5"/>
   </svg>`;
 }
 
-// ============================================================
-// Console
-// ============================================================
+/* ============================================================
+   Console
+   ============================================================ */
 function setupConsole() {
   document.body.classList.toggle("console-open", state.consoleOpen);
   $("#console-chevron").textContent = state.consoleOpen ? "▼" : "▲";
@@ -991,15 +1065,17 @@ function ensureConsoleOpen() {
   }
 }
 
-// ============================================================
-// Navigation
-// ============================================================
+/* ============================================================
+   Navigation
+   ============================================================ */
 function setupNav() {
   $$(".nav-item").forEach(btn => {
     btn.addEventListener("click", () => {
       const v = btn.dataset.view;
       $$(".nav-item").forEach(b => b.classList.toggle("active", b === btn));
       $$(".view").forEach(s => s.classList.toggle("active", s.dataset.view === v));
+
+      closeSidebar();
 
       if (v === "settings") loadSettings();
       if (v === "system") startMonitor();
@@ -1019,14 +1095,49 @@ function stopMonitor() {
   state.monitorTimer = null;
 }
 
-// ============================================================
-// Init
-// ============================================================
+/* ============================================================
+   Sidebar (mobile drawer)
+   ============================================================ */
+function openSidebar() {
+  if (window.innerWidth > 900) return;
+  $(".app").classList.add("sidebar-open");
+  $("#sidebar-overlay").classList.add("visible");
+  document.body.style.overflow = "hidden";
+}
+
+function closeSidebar() {
+  $(".app").classList.remove("sidebar-open");
+  $("#sidebar-overlay").classList.remove("visible");
+  document.body.style.overflow = "";
+}
+
+function setupSidebar() {
+  $("#hamburger")?.addEventListener("click", openSidebar);
+  $("#sidebar-overlay")?.addEventListener("click", closeSidebar);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeSidebar();
+  });
+
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (window.innerWidth > 900) {
+        closeSidebar();
+        document.body.style.overflow = "";
+      }
+    }, 150);
+  });
+}
+
+/* ============================================================
+   Init
+   ============================================================ */
 document.addEventListener("DOMContentLoaded", async () => {
-  // Загружаем настройки UI
   await loadLocales();
   await loadSettings();
-  // Тема из настроек
+
   document.documentElement.dataset.theme = state.settings["ui.theme"] || "dark";
   state.theme = state.settings["ui.theme"] || "dark";
   $$("[data-theme-set]").forEach(b =>
@@ -1037,6 +1148,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   );
 
   setupNav();
+  setupSidebar();
   setupDropzone();
   setupConsole();
   setupResultScroll();
@@ -1052,13 +1164,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#settings-reset").addEventListener("click", resetSettings);
   $("#history-refresh").addEventListener("click", refreshHistory);
 
-  // Retention info
   const hours = state.settings["server.retention_hours"] || 24;
   $("#retention-info").textContent = t("history.retention", { hours });
 
-  // Периодическое обновление GPU
   setInterval(loadSystem, 5000);
   refreshHistory();
   setInterval(refreshHistory, 10000);
+
   await restoreActiveJob();
 });

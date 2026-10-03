@@ -14,13 +14,14 @@ FastAPI-сервер приложения.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -334,10 +335,54 @@ async def locale_get(lang: str) -> Dict[str, str]:
     return data
 
 
-@app.get("/api/jobs", tags=["jobs"], summary="Список всех задач")
-async def list_jobs() -> Dict[str, Any]:
-    """Возвращает краткий список всех задач, отсортированный от новых к старым."""
-    return {"jobs": get_job_manager().list_summaries(limit=200)}
+@app.get("/api/jobs", tags=["jobs"], summary="Список задач с фильтрацией")
+async def list_jobs(
+    q: Optional[str] = Query(None, description="Поиск по имени, тексту, заметкам, тегам"),
+    status: Optional[str] = Query(None, description="Фильтр по статусу"),
+    favorite: Optional[bool] = Query(None, description="True — только избранные"),
+    tag: Optional[str] = Query(None, description="Фильтр по тегу"),
+    date_from: Optional[float] = Query(None, description="Мин. дата создания (Unix)"),
+    date_to: Optional[float] = Query(None, description="Макс. дата создания (Unix)"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    """
+    Возвращает краткий список задач с фильтрацией.
+
+    Все параметры опциональны и комбинируются через AND. Поиск q проверяет
+    имя файла, текст, заметки и теги. Список отсортирован от новых к старым.
+
+    Args:
+        q: Подстрока для поиска.
+        status: Фильтр по статусу (done, error, cancelled, interrupted, ...).
+        favorite: True — только избранные, False — только не-избранные.
+        tag: Фильтр по наличию тега.
+        date_from: Минимальная дата создания в Unix-времени.
+        date_to: Максимальная дата создания.
+        limit: Максимум записей (1–1000).
+        offset: Смещение для пагинации.
+
+    Returns:
+        Словарь {"jobs": [...], "offset": M, "limit": L, "active_count": N}.
+        active_count — общее число активных задач, не зависит от фильтров.
+    """
+    repo = get_repository()
+    jobs = repo.list_summaries(
+        limit=limit,
+        offset=offset,
+        query=q,
+        status=status,
+        favorite=favorite,
+        tag=tag,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return {
+        "jobs": jobs,
+        "offset": offset,
+        "limit": limit,
+        "active_count": repo.count_active(),
+    }
 
 
 @app.post(
@@ -346,51 +391,48 @@ async def list_jobs() -> Dict[str, Any]:
     summary="Создать задачу транскрибации",
     description="Принимает файл (multipart/form-data) и параметры обработки. "
                 "Возвращает ID задачи сразу; воркер запускается в фоне. "
-                "Следите за прогрессом через `/api/jobs/{id}/stream`.",
+                "Если check_duplicate=True и файл уже обрабатывался ранее — "
+                "возвращает 409 с информацией о дубликате.",
     responses={
         200: {
             "description": "Задача создана",
-            "content": {
-                "application/json": {
-                    "example": {"job_id": "a1b2c3d4e5f6", "status": "pending"}
-                }
-            },
+            "content": {"application/json": {
+                "example": {"job_id": "a1b2c3d4e5f6", "status": "pending"}
+            }},
         },
         400: {"description": "Неподдерживаемый формат файла"},
+        409: {"description": "Найден идентичный файл (SHA-256 совпадает)"},
         413: {"description": "Файл превышает лимит из настроек"},
     },
 )
 async def create_job(
-    file: UploadFile = File(...),
+    file: UploadFile = File(..., description="Аудио или видеофайл"),
     model: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
-) -> Dict[str, str]:
+    check_duplicate: bool = Form(True, description="Проверять ли дубликат по SHA-256"),
+) -> Dict[str, Any]:
     """
-    Создаёт новую задачу транскрибации и запускает воркер.
+    Создаёт новую задачу транскрибации.
 
-    Файл сохраняется на диск стримингом с проверкой размера на каждом
-    чанке — это позволяет отклонить слишком большой файл до того, как
-    он займёт всю оперативку или диск. Параметры model и language
-    опциональны: если не переданы, используются значения из текущих
-    runtime-настроек.
-
-    Воркер запускается в daemon-потоке сразу, ещё до возврата ответа
-    клиенту. Это значит, что SSE-подписка может подключиться уже к
-    работающей задаче — snapshot через /stream вернёт актуальное
-    состояние на момент подключения.
+    После сохранения файла считается его SHA-256 хеш — параллельно с
+    записью на диск, в одном проходе. Если check_duplicate=True и в БД
+    есть завершённая задача с тем же хешем, файл удаляется, а клиент
+    получает 409 Conflict с объектом duplicate_of.
 
     Args:
         file: Загруженный файл (multipart/form-data).
-        model: Название модели Whisper. None → значение из настроек.
-        language: Код языка или "auto". None или "auto" → автоопределение.
+        model: Название модели Whisper. None — значение из настроек.
+        language: Код языка или "auto".
+        check_duplicate: Если True и найден дубликат — вернуть 409.
 
     Returns:
         Словарь {"job_id": "...", "status": "pending"}.
 
     Raises:
-        HTTPException: 400, если формат не поддерживается;
-            413, если файл превышает лимит из настроек;
-            500, если не удалось сохранить файл на диск.
+        HTTPException: 400 — неподдерживаемый формат;
+            409 — найден дубликат (detail содержит duplicate_of);
+            413 — файл превышает лимит;
+            500 — ошибка сохранения.
     """
     ext = Path(file.filename).suffix.lower()
     if ext not in transcribe.ALL_SUPPORTED:
@@ -400,6 +442,8 @@ async def create_job(
     max_bytes = max_mb * 1024 * 1024
 
     jm = get_job_manager()
+    repo = get_repository()
+
     job = jm.create(
         filename=file.filename,
         file_path="",
@@ -415,6 +459,7 @@ async def create_job(
         jm._repo.update_job(job.id, file_path=str(file_path))
 
     size = 0
+    hasher = hashlib.sha256()
     try:
         with open(file_path, "wb") as f:
             while chunk := await file.read(1024 * 1024):
@@ -425,6 +470,7 @@ async def create_job(
                     jm.delete(job.id)
                     raise HTTPException(413, f"Файл превышает лимит {max_mb} МБ")
                 f.write(chunk)
+                hasher.update(chunk)
         job.file_size = size
     except HTTPException:
         raise
@@ -432,6 +478,26 @@ async def create_job(
         file_path.unlink(missing_ok=True)
         jm.delete(job.id)
         raise HTTPException(500, f"Ошибка сохранения: {e}")
+
+    file_hash = hasher.hexdigest()
+    if jm._repo:
+        try:
+            jm._repo.update_job(job.id, file_hash=file_hash)
+        except Exception:
+            pass
+
+    if check_duplicate:
+        existing = repo.find_by_hash(file_hash)
+        if existing:
+            file_path.unlink(missing_ok=True)
+            jm.delete(job.id)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Найден идентичный файл",
+                    "duplicate_of": existing,
+                },
+            )
 
     job.log("info", f"Задача {job.id} создана: {file.filename} ({size / 1024 / 1024:.1f} МБ)")
 
@@ -481,6 +547,93 @@ async def update_job_notes(job_id: str, payload: Dict[str, Any]) -> Dict[str, An
 
     snap = repo.get_job(job_id)
     return {"ok": True, "tags": snap.get("tags", []), "notes": snap.get("notes", "")}
+
+
+@app.patch(
+    "/api/jobs/{job_id}/star",
+    tags=["jobs"],
+    summary="Установить или снять метку избранного",
+)
+async def set_job_star(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Устанавливает или снимает метку «избранное».
+
+    Args:
+        job_id: Идентификатор задачи.
+        payload: {"starred": true|false}.
+
+    Returns:
+        {"ok": True, "starred": <актуальное значение>}.
+
+    Raises:
+        HTTPException: 400 — некорректный payload;
+                       404 — задача не найдена.
+    """
+    if not isinstance(payload, dict) or "starred" not in payload:
+        raise HTTPException(400, "Ожидается {'starred': bool}")
+    starred = bool(payload["starred"])
+
+    repo = get_repository()
+    if not repo.set_starred(job_id, starred):
+        raise HTTPException(404, "Задача не найдена")
+    return {"ok": True, "starred": starred}
+
+
+@app.patch(
+    "/api/jobs/{job_id}/segments/{idx}",
+    tags=["jobs"],
+    summary="Обновить текст сегмента",
+    description="Заменяет текст сегмента и пересобирает полный текст задачи. "
+                "Синхронизирует состояние активной задачи в памяти с БД.",
+)
+async def update_segment(
+    job_id: str, idx: int, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Обновляет текст сегмента и пересчитывает полный текст задачи.
+
+    Используется для ручной правки расшифровки. Если задача активна
+    (есть в памяти), обновляется и её in-memory копия, чтобы SSE-подписчики
+    видели согласованное состояние.
+
+    Args:
+        job_id: Идентификатор задачи.
+        idx: Индекс сегмента (0-based).
+        payload: {"text": "новый текст"}.
+
+    Returns:
+        {"ok": True, "text": "новый полный текст задачи"}.
+
+    Raises:
+        HTTPException: 400 — некорректный payload;
+                       404 — задача или сегмент не найдены.
+    """
+    if not isinstance(payload, dict) or "text" not in payload:
+        raise HTTPException(400, "Ожидается {'text': str}")
+    text = str(payload["text"]).strip()
+    if not text:
+        raise HTTPException(400, "Текст не может быть пустым")
+
+    repo = get_repository()
+    if not repo.get_job(job_id):
+        raise HTTPException(404, "Задача не найдена")
+
+    if not repo.update_segment_text(job_id, idx, text):
+        raise HTTPException(404, f"Сегмент {idx} не найден")
+
+    snap = repo.get_job(job_id)
+    full_text = snap.get("text", "")
+
+    jm = get_job_manager()
+    active = jm.get(job_id)
+    if active:
+        for seg in active.segments:
+            if seg["index"] == idx:
+                seg["text"] = text
+                break
+        active.text = full_text
+
+    return {"ok": True, "text": full_text}
 
 
 @app.get("/api/jobs/{job_id}", tags=["jobs"], summary="Полный снимок задачи")

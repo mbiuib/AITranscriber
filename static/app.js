@@ -31,6 +31,7 @@ const state = {
   seenSegmentsCount: 0,
   detailJob: null,
   detailTags: [],
+  historyFilter: { q: "", status: "", favorite: false },
 };
 
 /* ============================================================
@@ -395,7 +396,15 @@ async function saveSettings() {
 }
 
 async function resetSettings() {
-  if (!confirm(t("settings.reset_confirm"))) return;
+  const confirmed = await showConfirm({
+    title: "Сбросить настройки?",
+    message: "Все параметры вернутся к значениям по умолчанию из <code>.env</code>.",
+    confirmText: "Сбросить",
+    icon: "restart_alt",
+    danger: true,
+  });
+  if (!confirmed) return;
+
   const r = await fetch("/api/settings/reset", { method: "POST" });
   const d = await r.json();
   state.settings = d.values;
@@ -418,14 +427,6 @@ function getSavedJobId() {
   try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; }
 }
 
-/**
- * Восстанавливает активную задачу после перезагрузки страницы.
- *
- * Сначала проверяет ID из localStorage. Если его нет — ищет любую
- * активную задачу через /api/jobs. Для активной задачи восстанавливает
- * снимок и подписывается на SSE, для завершённой — показывает финал
- * без подписки.
- */
 async function restoreActiveJob() {
   let jobId = getSavedJobId();
 
@@ -543,7 +544,7 @@ function formatSize(bytes) {
 /* ============================================================
    Start / cancel
    ============================================================ */
-async function start() {
+async function start(forceReprocess = false) {
   if (!state.file || state.running) return;
   resetResult();
 
@@ -556,9 +557,32 @@ async function start() {
   fd.append("file", state.file);
   fd.append("model", state.quickRefs.modelSel.value);
   fd.append("language", state.quickRefs.langSel.value);
+  if (forceReprocess) fd.append("check_duplicate", "false");
 
   try {
     const r = await fetch("/api/jobs", { method: "POST", body: fd });
+
+    if (r.status === 409) {
+      const d = await r.json();
+      const dup = d.detail?.duplicate_of;
+
+      state.running = false;
+      $("#start-btn").disabled = !state.file;
+      $("#cancel-btn").disabled = true;
+      resetResult();
+
+      if (dup) {
+        const choice = await showDuplicateModal(dup);
+
+        if (choice === "open") {
+          openJobDetail(dup.id);
+        } else if (choice === "reprocess") {
+          await start(true);
+        }
+      }
+      return;
+    }
+
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const d = await r.json();
     state.jobId = d.job_id;
@@ -576,6 +600,16 @@ async function start() {
 
 async function cancelJob() {
   if (!state.jobId) return;
+
+  const confirmed = await showConfirm({
+    title: "Прервать транскрибацию?",
+    message: "Уже обработанные сегменты сохранятся, но полный результат будет недоступен.",
+    confirmText: "Прервать",
+    icon: "stop_circle",
+    danger: true,
+  });
+  if (!confirmed) return;
+
   await fetch(`/api/jobs/${state.jobId}/cancel`, { method: "POST" });
   toast("warn", "stop_circle", t("toast.cancelled"));
 }
@@ -834,7 +868,7 @@ function resetResult() {
 }
 
 /* ============================================================
-   Export
+   Export (главное окно)
    ============================================================ */
 async function copyText() {
   if (!state.segments.length) return;
@@ -890,14 +924,20 @@ function downloadBlob(content, name, mime) {
    ============================================================ */
 async function refreshHistory() {
   try {
-    const r = await fetch("/api/jobs");
+    const f = state.historyFilter || {};
+    const params = new URLSearchParams();
+    if (f.q) params.set("q", f.q);
+    if (f.status) params.set("status", f.status);
+    if (f.favorite) params.set("favorite", "true");
+
+    const url = "/api/jobs" + (params.toString() ? "?" + params : "");
+    const r = await fetch(url);
     const d = await r.json();
     state.jobs = d.jobs;
     renderHistory();
+
     const badge = $("#nav-badge-history");
-    const active = state.jobs.filter(j =>
-      ["pending", "downloading", "loading", "transcribing"].includes(j.status)
-    ).length;
+    const active = d.active_count || 0;
     badge.hidden = active === 0;
     badge.textContent = active;
   } catch {}
@@ -927,6 +967,9 @@ function renderHistory() {
       : "";
 
     item.innerHTML = `
+      <button class="history-star ${j.starred ? "starred" : ""}" title="В избранное">
+        <span class="material-symbols-rounded">star</span>
+      </button>
       <div class="history-icon">
         <span class="material-symbols-rounded">movie</span>
       </div>
@@ -942,19 +985,89 @@ function renderHistory() {
     `;
     item.querySelector(".history-name").textContent = j.filename;
 
+    item.querySelector(".history-star").addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleStar(j.id, j.starred);
+    });
+
     item.addEventListener("click", (e) => {
       if (e.target.closest('[data-action="delete"]')) return;
+      if (e.target.closest(".history-star")) return;
       openJobDetail(j.id);
     });
 
     item.querySelector('[data-action="delete"]').addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (!confirm(t("history.delete_confirm"))) return;
+
+      const confirmed = await showConfirm({
+        title: "Удалить задачу?",
+        message: `Файл <strong>${escapeHtml(j.filename)}</strong> и все его данные будут удалены безвозвратно.`,
+        confirmText: "Удалить",
+        icon: "delete",
+        danger: true,
+      });
+      if (!confirmed) return;
+
       await fetch(`/api/jobs/${j.id}`, { method: "DELETE" });
       toast("success", "delete", t("toast.job_deleted"));
       refreshHistory();
     });
+
     list.appendChild(item);
+  }
+}
+
+function setupHistoryFilters() {
+  const q = $("#filter-q");
+  const status = $("#filter-status");
+  const fav = $("#filter-favorite");
+  const reset = $("#filter-reset");
+
+  let debounce;
+  q.addEventListener("input", () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      state.historyFilter.q = q.value.trim();
+      refreshHistory();
+    }, 250);
+  });
+
+  status.addEventListener("change", () => {
+    state.historyFilter.status = status.value;
+    refreshHistory();
+  });
+
+  fav.addEventListener("click", () => {
+    state.historyFilter.favorite = !state.historyFilter.favorite;
+    fav.classList.toggle("active", state.historyFilter.favorite);
+    refreshHistory();
+  });
+
+  reset.addEventListener("click", () => {
+    state.historyFilter = { q: "", status: "", favorite: false };
+    q.value = "";
+    status.value = "";
+    fav.classList.remove("active");
+    refreshHistory();
+  });
+}
+
+async function toggleStar(jobId, current) {
+  try {
+    const r = await fetch(`/api/jobs/${jobId}/star`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ starred: !current }),
+    });
+    if (!r.ok) throw new Error("Ошибка сохранения");
+    const d = await r.json();
+    const job = state.jobs.find(j => j.id === jobId);
+    if (job) job.starred = d.starred;
+    renderHistory();
+    return d.starred;
+  } catch (e) {
+    toast("error", "error", e.message);
+    return current;
   }
 }
 
@@ -1099,6 +1212,72 @@ function ensureConsoleOpen() {
 }
 
 /* ============================================================
+   Navigation
+   ============================================================ */
+function setupNav() {
+  $$(".nav-item").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const v = btn.dataset.view;
+      $$(".nav-item").forEach(b => b.classList.toggle("active", b === btn));
+      $$(".view").forEach(s => s.classList.toggle("active", s.dataset.view === v));
+
+      closeSidebar();
+
+      if (v === "settings") loadSettings();
+      if (v === "system") startMonitor();
+      else stopMonitor();
+      if (v === "history") refreshHistory();
+    });
+  });
+}
+
+function startMonitor() {
+  stopMonitor();
+  updateMonitor();
+  state.monitorTimer = setInterval(updateMonitor, 1500);
+}
+function stopMonitor() {
+  if (state.monitorTimer) clearInterval(state.monitorTimer);
+  state.monitorTimer = null;
+}
+
+/* ============================================================
+   Sidebar (mobile drawer)
+   ============================================================ */
+function openSidebar() {
+  if (window.innerWidth > 900) return;
+  $(".app").classList.add("sidebar-open");
+  $("#sidebar-overlay").classList.add("visible");
+  document.body.style.overflow = "hidden";
+}
+
+function closeSidebar() {
+  $(".app").classList.remove("sidebar-open");
+  $("#sidebar-overlay").classList.remove("visible");
+  document.body.style.overflow = "";
+}
+
+function setupSidebar() {
+  $("#hamburger")?.addEventListener("click", openSidebar);
+  $("#sidebar-overlay")?.addEventListener("click", closeSidebar);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeSidebar();
+  });
+
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (window.innerWidth > 900) {
+        closeSidebar();
+        document.body.style.overflow = "";
+      }
+    }, 150);
+  });
+}
+
+/* ============================================================
    Job detail modal
    ============================================================ */
 async function openJobDetail(jobId) {
@@ -1114,7 +1293,6 @@ async function openJobDetail(jobId) {
     $("#detail-modal").classList.add("visible");
     document.body.style.overflow = "hidden";
 
-    // Активируем вкладку «Транскрипт» по умолчанию
     $$(".modal-tab").forEach(t =>
       t.classList.toggle("active", t.dataset.dtab === "transcript")
     );
@@ -1137,21 +1315,14 @@ function renderDetail(snap) {
   $("#detail-filename").textContent = snap.filename;
   $("#detail-filename").title = snap.filename;
 
-  // Транскрипт
+  const star = $("#detail-star");
+  star.classList.toggle("starred", !!snap.starred);
+
   const tr = $("#detail-transcript");
   if (snap.segments && snap.segments.length) {
     tr.innerHTML = "";
     for (const s of snap.segments) {
-      const line = document.createElement("div");
-      line.className = "segment";
-      const g = document.createElement("span");
-      g.className = "gutter";
-      g.textContent = formatTs(s.start);
-      const tx = document.createElement("span");
-      tx.className = "text";
-      tx.textContent = s.text;
-      line.append(g, tx);
-      tr.appendChild(line);
+      tr.appendChild(buildSegmentRow(s));
     }
   } else if (snap.text) {
     tr.textContent = snap.text;
@@ -1159,14 +1330,116 @@ function renderDetail(snap) {
     tr.innerHTML = `<div class="empty-state"><div class="empty-icon material-symbols-rounded">hourglass_empty</div><div class="empty-text">Результат ещё не готов</div></div>`;
   }
 
-  // Метаданные
   renderDetailMeta(snap);
-
-  // Статистика
   renderDetailStats(snap);
-
-  // Теги и заметки
   renderDetailNotes(snap);
+}
+
+/**
+ * Создаёт DOM-строку одного сегмента с обработчиком редактирования.
+ * Клик по тексту запускает inline-редактор (textarea).
+ *
+ * @param {object} seg Объект сегмента {index, start, end, text}.
+ * @returns {HTMLElement} Готовая строка.
+ */
+function buildSegmentRow(seg) {
+  const line = document.createElement("div");
+  line.className = "segment";
+
+  const g = document.createElement("span");
+  g.className = "gutter";
+  g.textContent = formatTs(seg.start);
+
+  const tx = document.createElement("span");
+  tx.className = "text";
+  tx.textContent = seg.text;
+
+  line.append(g, tx);
+
+  line.addEventListener("click", (e) => {
+    if (line.querySelector("textarea.segment-edit")) return;
+    if (e.target.tagName === "TEXTAREA") return;
+    startSegmentEdit(line, seg);
+  });
+
+  return line;
+}
+
+/**
+ * Открывает inline-редактор для сегмента.
+ *
+ * Enter — сохранить, Shift+Enter — перенос строки, Esc — отменить,
+ * blur — сохранить. Высота textarea автоматически подстраивается под
+ * содержимое: при открытии и после каждого ввода.
+ *
+ * @param {HTMLElement} line Строка сегмента.
+ * @param {object} seg Объект сегмента.
+ */
+function startSegmentEdit(line, seg) {
+  const textEl = line.querySelector(".text");
+  const original = seg.text;
+
+  const ta = document.createElement("textarea");
+  ta.className = "segment-edit";
+  ta.value = original;
+  ta.rows = 1;
+
+  textEl.replaceWith(ta);
+
+  const autoGrow = () => {
+    ta.style.height = "auto";
+    ta.style.height = ta.scrollHeight + "px";
+  };
+
+  autoGrow();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+
+  ta.addEventListener("input", autoGrow);
+
+  let cancelled = false;
+
+  const finish = async (save) => {
+    const newText = ta.value.trim();
+
+    if (save && newText && newText !== original) {
+      try {
+        const r = await fetch(
+          `/api/jobs/${state.detailJob.id}/segments/${seg.index}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: newText }),
+          }
+        );
+        if (!r.ok) throw new Error((await r.json()).detail || "Ошибка сохранения");
+        const d = await r.json();
+        seg.text = newText;
+        state.detailJob.text = d.text;
+        toast("success", "check_circle", "Сегмент обновлён");
+      } catch (e) {
+        toast("error", "error", e.message);
+      }
+    }
+
+    const span = document.createElement("span");
+    span.className = "text";
+    span.textContent = seg.text;
+    ta.replaceWith(span);
+  };
+
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      ta.blur();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelled = true;
+      ta.blur();
+    }
+  });
+
+  ta.addEventListener("blur", () => finish(!cancelled));
 }
 
 function renderDetailMeta(snap) {
@@ -1360,7 +1633,6 @@ function setupDetailModal() {
     });
   });
 
-  // Ввод тега
   $("#detail-tag-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.target.value.trim()) {
       e.preventDefault();
@@ -1374,6 +1646,13 @@ function setupDetailModal() {
   });
 
   $("#detail-save-notes").addEventListener("click", saveDetailNotes);
+
+  $("#detail-star").addEventListener("click", async () => {
+    if (!state.detailJob) return;
+    const newVal = await toggleStar(state.detailJob.id, !!state.detailJob.starred);
+    state.detailJob.starred = newVal;
+    $("#detail-star").classList.toggle("starred", newVal);
+  });
 
   // Экспорт из модалки
   $("#d-act-copy").addEventListener("click", () => {
@@ -1419,70 +1698,176 @@ function setupDetailModal() {
   });
 }
 
-/* ============================================================
-   Navigation
-   ============================================================ */
-function setupNav() {
-  $$(".nav-item").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const v = btn.dataset.view;
-      $$(".nav-item").forEach(b => b.classList.toggle("active", b === btn));
-      $$(".view").forEach(s => s.classList.toggle("active", s.dataset.view === v));
+/**
+ * Показывает модалку о найденном дубликате файла.
+ *
+ * Возвращает Promise, который резолвится одним из значений:
+ *   "open"       — открыть существующий результат
+ *   "reprocess"  — обработать заново
+ *   null         — закрыть без действия
+ *
+ * Закрытие через Esc, клик по overlay или по кнопке X резолвит null.
+ *
+ * @param {object} dup Информация о дубликате: id, filename, created_at,
+ *                     duration, segments_count.
+ * @returns {Promise<"open"|"reprocess"|null>}
+ */
+function showDuplicateModal(dup) {
+  return new Promise((resolve) => {
+    const modal = $("#duplicate-modal");
+    const elFilename = $("#dup-filename");
+    const elMeta = $("#dup-meta");
 
-      closeSidebar();
+    elFilename.textContent = dup.filename;
+    elFilename.title = dup.filename;
 
-      if (v === "settings") loadSettings();
-      if (v === "system") startMonitor();
-      else stopMonitor();
-      if (v === "history") refreshHistory();
+    const created = new Date(dup.created_at * 1000).toLocaleString("ru-RU", {
+      day: "2-digit", month: "short", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
     });
+    const dur = dup.duration ? formatTs(dup.duration) : "—";
+    const segs = dup.segments_count != null ? dup.segments_count : "—";
+    elMeta.textContent = `${created}  ·  ${dur}  ·  ${segmentsLabel(segs)}`;
+
+    const cleanup = () => {
+      modal.classList.remove("visible");
+      document.body.style.overflow = "";
+      $("#duplicate-close").removeEventListener("click", onClose);
+      $("#dup-open").removeEventListener("click", onOpen);
+      $("#dup-reprocess").removeEventListener("click", onReprocess);
+      modal.removeEventListener("click", onOverlay);
+      document.removeEventListener("keydown", onKey);
+    };
+
+    const finish = (result) => {
+      cleanup();
+      resolve(result);
+    };
+
+    const onClose = () => finish(null);
+    const onOpen = () => finish("open");
+    const onReprocess = () => finish("reprocess");
+
+    const onOverlay = (e) => {
+      if (e.target === modal) finish(null);
+    };
+
+    const onKey = (e) => {
+      if (e.key === "Escape") finish(null);
+    };
+
+    $("#duplicate-close").addEventListener("click", onClose);
+    $("#dup-open").addEventListener("click", onOpen);
+    $("#dup-reprocess").addEventListener("click", onReprocess);
+    modal.addEventListener("click", onOverlay);
+    document.addEventListener("keydown", onKey);
+
+    modal.classList.add("visible");
+    document.body.style.overflow = "hidden";
+
+    // Автофокус на основную кнопку — чтобы Enter сработал сразу
+    setTimeout(() => $("#dup-open").focus(), 50);
   });
 }
 
-function startMonitor() {
-  stopMonitor();
-  updateMonitor();
-  state.monitorTimer = setInterval(updateMonitor, 1500);
-}
-function stopMonitor() {
-  if (state.monitorTimer) clearInterval(state.monitorTimer);
-  state.monitorTimer = null;
-}
+/**
+ * Универсальная confirm-модалка, заменяющая системный confirm().
+ *
+ * Возвращает Promise<boolean>: true — пользователь подтвердил,
+ * false — отменил или закрыл модалку любым способом (Esc, клик
+ * по overlay, крестик).
+ *
+ * Enter — подтвердить, Esc — отменить. Автофокус на кнопку действия
+ * после появления модалки, чтобы можно было сразу нажать Enter.
+ *
+ * @param {object} opts Параметры диалога.
+ * @param {string} opts.title Заголовок.
+ * @param {string} [opts.message] Текст. Поддерживает HTML — экранируйте
+ *     пользовательские данные через escapeHtml() самостоятельно.
+ * @param {string} [opts.confirmText="Подтвердить"] Текст кнопки действия.
+ * @param {string} [opts.cancelText="Отмена"] Текст кнопки отмены.
+ * @param {string} [opts.icon="help"] Имя Material Symbol для заголовка.
+ * @param {boolean} [opts.danger=false] Красная кнопка для деструктивных
+ *     действий (удаление, сброс, прерывание).
+ * @returns {Promise<boolean>}
+ */
+function showConfirm({
+  title,
+  message = "",
+  confirmText = "Подтвердить",
+  cancelText = "Отмена",
+  icon = "help",
+  danger = false,
+} = {}) {
+  return new Promise((resolve) => {
+    const modal = $("#confirm-modal");
+    const iconEl = $("#confirm-icon");
+    const titleEl = $("#confirm-title");
+    const msgEl = $("#confirm-message");
+    const okBtn = $("#confirm-ok");
+    const cancelBtn = $("#confirm-cancel");
 
-/* ============================================================
-   Sidebar (mobile drawer)
-   ============================================================ */
-function openSidebar() {
-  if (window.innerWidth > 900) return;
-  $(".app").classList.add("sidebar-open");
-  $("#sidebar-overlay").classList.add("visible");
-  document.body.style.overflow = "hidden";
-}
+    iconEl.textContent = icon;
+    titleEl.textContent = title;
+    msgEl.innerHTML = message;
+    okBtn.textContent = confirmText;
+    cancelBtn.textContent = cancelText;
+    modal.classList.toggle("danger", danger);
 
-function closeSidebar() {
-  $(".app").classList.remove("sidebar-open");
-  $("#sidebar-overlay").classList.remove("visible");
-  document.body.style.overflow = "";
-}
+    const cleanup = () => {
+      modal.classList.remove("visible");
+      document.body.style.overflow = "";
+      $("#confirm-close").removeEventListener("click", onCancel);
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      modal.removeEventListener("click", onOverlay);
+      document.removeEventListener("keydown", onKey);
+    };
 
-function setupSidebar() {
-  $("#hamburger")?.addEventListener("click", openSidebar);
-  $("#sidebar-overlay")?.addEventListener("click", closeSidebar);
+    const finish = (result) => {
+      cleanup();
+      resolve(result);
+    };
 
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeSidebar();
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+
+    const onOverlay = (e) => {
+      if (e.target === modal) finish(false);
+    };
+
+    const onKey = (e) => {
+      if (e.key === "Escape") finish(false);
+      else if (e.key === "Enter") finish(true);
+    };
+
+    $("#confirm-close").addEventListener("click", onCancel);
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    modal.addEventListener("click", onOverlay);
+    document.addEventListener("keydown", onKey);
+
+    modal.classList.add("visible");
+    document.body.style.overflow = "hidden";
+
+    setTimeout(() => okBtn.focus(), 50);
   });
+}
 
-  let resizeTimer;
-  window.addEventListener("resize", () => {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-      if (window.innerWidth > 900) {
-        closeSidebar();
-        document.body.style.overflow = "";
-      }
-    }, 150);
-  });
+/**
+ * Возвращает правильную форму слова «сегмент».
+ *
+ * @param {number} n Количество сегментов.
+ * @returns {string} Строка вида "12 сегментов".
+ */
+function segmentsLabel(n) {
+  if (typeof n !== "number") return "";
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  let word = "сегментов";
+  if (mod10 === 1 && mod100 !== 11) word = "сегмент";
+  else if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) word = "сегмента";
+  return `${n} ${word}`;
 }
 
 /* ============================================================
@@ -1505,11 +1890,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupSidebar();
   setupDropzone();
   setupConsole();
-  setupDetailModal();
   setupResultScroll();
+  setupDetailModal();
+  setupHistoryFilters();
   await loadSystem();
 
-  $("#start-btn").addEventListener("click", start);
+  $("#start-btn").addEventListener("click", () => start(false));
   $("#cancel-btn").addEventListener("click", cancelJob);
   $("#act-copy").addEventListener("click", copyText);
   $("#act-txt").addEventListener("click", downloadTxt);

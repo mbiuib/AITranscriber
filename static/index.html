@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="theme-color" content="#0f0f17">
 <title>Whisper Transcriber</title>
+
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -193,6 +194,28 @@
       </header>
       <div class="view-body">
         <div class="card">
+          <div class="history-filters">
+            <div class="filter-search">
+              <span class="material-symbols-rounded">search</span>
+              <input type="search" id="filter-q" placeholder="Поиск по имени, тексту, заметкам…">
+            </div>
+            <select id="filter-status" class="filter-select">
+              <option value="">Все статусы</option>
+              <option value="done">Готово</option>
+              <option value="transcribing">В работе</option>
+              <option value="error">Ошибка</option>
+              <option value="cancelled">Отменено</option>
+              <option value="interrupted">Прервано</option>
+            </select>
+            <button class="filter-chip" id="filter-favorite">
+              <span class="material-symbols-rounded">star</span>
+              <span>Избранное</span>
+            </button>
+            <button class="filter-chip" id="filter-reset">
+              <span class="material-symbols-rounded">restart_alt</span>
+              <span>Сброс</span>
+            </button>
+          </div>
           <div id="history-list" class="history-list">
             <div class="empty-state">
               <div class="empty-icon material-symbols-rounded">history_toggle_off</div>
@@ -269,9 +292,14 @@
         <span class="material-symbols-rounded">description</span>
         <span id="detail-filename"></span>
       </div>
-      <button class="modal-close" id="detail-close">
-        <span class="material-symbols-rounded">close</span>
-      </button>
+      <div style="display: flex; gap: 4px; align-items: center;">
+        <button class="modal-star" id="detail-star" title="В избранное">
+          <span class="material-symbols-rounded">star</span>
+        </button>
+        <button class="modal-close" id="detail-close">
+          <span class="material-symbols-rounded">close</span>
+        </button>
+      </div>
     </div>
 
     <div class="modal-tabs">
@@ -312,6 +340,10 @@
             <span class="material-symbols-rounded">data_object</span>
             .json
           </button>
+          <span class="modal-hint">
+            <span class="material-symbols-rounded">info</span>
+            Клик по тексту — редактирование
+          </span>
         </div>
         <div class="modal-transcript" id="detail-transcript"></div>
       </div>
@@ -341,6 +373,77 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Duplicate Modal ============ -->
+<div class="modal-overlay" id="duplicate-modal">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <div class="modal-title">
+        <span class="material-symbols-rounded">content_copy</span>
+        <span>Найден идентичный файл</span>
+      </div>
+      <button class="modal-close" id="duplicate-close">
+        <span class="material-symbols-rounded">close</span>
+      </button>
+    </div>
+
+    <div class="modal-body-static">
+      <p class="dup-message">
+        Этот файл уже был обработан ранее. SHA-256 совпадает с существующей записью.
+      </p>
+
+      <div class="dup-card">
+        <div class="dup-card-icon">
+          <span class="material-symbols-rounded">movie</span>
+        </div>
+        <div class="dup-card-main">
+          <div class="dup-card-name" id="dup-filename"></div>
+          <div class="dup-card-meta" id="dup-meta"></div>
+        </div>
+      </div>
+
+      <p class="dup-hint">
+        Можно открыть готовый результат или запустить обработку заново
+        с текущими настройками.
+      </p>
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" id="dup-reprocess">
+        <span class="material-symbols-rounded">refresh</span>
+        Обработать заново
+      </button>
+      <button class="btn btn-primary" id="dup-open">
+        <span class="material-symbols-rounded">open_in_new</span>
+        Открыть результат
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Confirm Modal ============ -->
+<div class="modal-overlay" id="confirm-modal">
+  <div class="modal modal-xs">
+    <div class="modal-header">
+      <div class="modal-title">
+        <span class="material-symbols-rounded" id="confirm-icon">help</span>
+        <span id="confirm-title">Подтверждение</span>
+      </div>
+      <button class="modal-close" id="confirm-close">
+        <span class="material-symbols-rounded">close</span>
+      </button>
+    </div>
+
+    <div class="modal-body-static">
+      <p class="confirm-message" id="confirm-message"></p>
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" id="confirm-cancel">Отмена</button>
+      <button class="btn btn-primary" id="confirm-ok">Подтвердить</button>
     </div>
   </div>
 </div>

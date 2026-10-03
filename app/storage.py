@@ -157,6 +157,7 @@ class JobRepository:
             "notes": "TEXT",
             "settings_snapshot": "TEXT",
             "file_hash": "TEXT",
+            "starred": "INTEGER NOT NULL DEFAULT 0",
         }
         cur.execute("PRAGMA table_info(jobs)")
         existing = {row["name"] for row in cur.fetchall()}
@@ -166,6 +167,10 @@ class JobRepository:
                 cur.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_file_hash ON jobs(file_hash)")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_starred "
+            "ON jobs(starred) WHERE starred = 1"
+        )
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def create_job(self, job: Dict[str, Any]) -> None:
@@ -266,29 +271,49 @@ class JobRepository:
             cur.close()
             return affected > 0
 
-    def find_by_hash(self, file_hash: str) -> Optional[str]:
+    def find_by_hash(self, file_hash: str) -> Optional[Dict[str, Any]]:
         """
-        Ищет задачу по хешу исходного файла.
+        Ищет завершённую задачу по SHA-256 хешу исходного файла.
 
-        Используется для дедупликации: если пользователь загружает
-        тот же файл повторно, можно показать предыдущий результат.
+        Используется для дедупликации: если пользователь загружает тот
+        же файл повторно, клиент может предложить открыть существующий
+        результат вместо повторной обработки.
 
         Args:
-            file_hash: SHA-256 хеш файла.
+            file_hash: Hex-строка SHA-256.
 
         Returns:
-            ID первой найденной задачи или None.
+            Словарь с полями id, filename, created_at, duration,
+            segments_count — или None, если дубликат не найден.
+            Рассматриваются только задачи со статусом done.
         """
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "SELECT id FROM jobs WHERE file_hash = ? "
-                "AND status = 'done' ORDER BY created_at DESC LIMIT 1",
+                """
+                SELECT j.id, j.filename, j.created_at, j.metadata,
+                       (SELECT COUNT(*) FROM job_segments WHERE job_id = j.id)
+                           AS segments_count
+                FROM jobs j
+                WHERE j.file_hash = ? AND j.status = 'done'
+                ORDER BY j.created_at DESC
+                LIMIT 1
+                """,
                 (file_hash,),
             )
             row = cur.fetchone()
             cur.close()
-            return row["id"] if row else None
+
+        if not row:
+            return None
+        meta = json.loads(row["metadata"] or "{}")
+        return {
+            "id": row["id"],
+            "filename": row["filename"],
+            "created_at": row["created_at"],
+            "duration": meta.get("duration"),
+            "segments_count": row["segments_count"],
+        }
 
     def append_log(self, job_id: str, entry: Dict[str, Any], max_logs: int = 5000) -> None:
         """
@@ -452,36 +477,106 @@ class JobRepository:
                 "SELECT idx, start, end, text FROM job_segments WHERE job_id = ? ORDER BY idx",
                 (job_id,),
             )
-            job["segments"] = [dict(r) for r in cur.fetchall()]
+            job["segments"] = [
+                {
+                    "index": row["idx"],
+                    "start": row["start"],
+                    "end": row["end"],
+                    "text": row["text"],
+                }
+                for row in cur.fetchall()
+            ]
 
             cur.close()
             return job
 
-    def list_summaries(self, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+    def list_summaries(
+            self,
+            limit: int = 200,
+            offset: int = 0,
+            query: Optional[str] = None,
+            status: Optional[str] = None,
+            favorite: Optional[bool] = None,
+            tag: Optional[str] = None,
+            date_from: Optional[float] = None,
+            date_to: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Возвращает краткие сведения о задачах для списка истории.
+        Возвращает краткие сведения о задачах с фильтрацией.
+
+        Все фильтры опциональны и комбинируются через AND. Поиск query
+        проверяет имя файла, текст, заметки и теги через LIKE.
+
+        Регистронезависимость поиска гарантируется только для ASCII:
+        встроенный SQLite LIKE не учитывает юникод-регистр без расширения
+        ICU. Для кириллицы поиск регистрозависим.
 
         Args:
             limit: Максимум записей.
             offset: Смещение для пагинации.
+            query: Подстрока для поиска по filename, text, notes, tags.
+            status: Фильтр по статусу (done, error, cancelled, interrupted).
+            favorite: True — только избранные, False — только не-избранные,
+                None — без фильтра.
+            tag: Фильтр по наличию тега (точное совпадение в JSON-массиве).
+            date_from: Минимальная дата создания (Unix-время).
+            date_to: Максимальная дата создания (Unix-время).
 
         Returns:
             Список словарей, отсортированный от новых к старым.
+            Каждый элемент содержит поле starred (bool).
         """
+        where: List[str] = []
+        params: List[Any] = []
+
+        if query:
+            like = f"%{query}%"
+            where.append(
+                "(j.filename LIKE ? OR j.text LIKE ? OR "
+                "COALESCE(j.notes, '') LIKE ? OR COALESCE(j.tags, '') LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+
+        if status:
+            where.append("j.status = ?")
+            params.append(status)
+
+        if favorite is True:
+            where.append("j.starred = 1")
+        elif favorite is False:
+            where.append("(j.starred = 0 OR j.starred IS NULL)")
+
+        if tag:
+            where.append("j.tags LIKE ?")
+            params.append(f'%"{tag}"%')
+
+        if date_from is not None:
+            where.append("j.created_at >= ?")
+            params.append(date_from)
+
+        if date_to is not None:
+            where.append("j.created_at <= ?")
+            params.append(date_to)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        params.extend([limit, offset])
+
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                """
+                f"""
                 SELECT
                     j.id, j.filename, j.file_size, j.model, j.status, j.progress,
                     j.created_at, j.finished_at, j.metadata, j.tags, j.notes,
-                    j.source_metadata, j.processing_stats,
-                    (SELECT COUNT(*) FROM job_segments WHERE job_id = j.id) AS segments_count
+                    j.source_metadata, j.processing_stats, j.starred,
+                    (SELECT COUNT(*) FROM job_segments WHERE job_id = j.id)
+                        AS segments_count
                 FROM jobs j
+                {where_sql}
                 ORDER BY j.created_at DESC
                 LIMIT ? OFFSET ?
                 """,
-                (limit, offset),
+                params,
             )
             rows = cur.fetchall()
             cur.close()
@@ -509,8 +604,67 @@ class JobRepository:
                 "notes": row["notes"] or "",
                 "source_metadata": source_meta,
                 "processing_stats": proc_stats,
+                "starred": bool(row["starred"]),
             })
         return result
+
+    def set_starred(self, job_id: str, starred: bool) -> bool:
+        """
+        Устанавливает или снимает метку «избранное».
+
+        Args:
+            job_id: Идентификатор задачи.
+            starred: True — добавить в избранное, False — убрать.
+
+        Returns:
+            True, если задача была найдена и обновлена.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE jobs SET starred = ? WHERE id = ?",
+                (1 if starred else 0, job_id),
+            )
+            affected = cur.rowcount
+            cur.close()
+            return affected > 0
+
+    def update_segment_text(self, job_id: str, idx: int, text: str) -> bool:
+        """
+        Обновляет текст сегмента и пересобирает полный текст задачи.
+
+        Вызывается при ручной правке расшифровки в UI. После обновления
+        колонка text в таблице jobs пересчитывается из всех сегментов.
+
+        Args:
+            job_id: Идентификатор задачи.
+            idx: Индекс сегмента (0-based, соответствует полю idx в БД).
+            text: Новый текст сегмента.
+
+        Returns:
+            True, если сегмент был найден и обновлён.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE job_segments SET text = ? WHERE job_id = ? AND idx = ?",
+                (text, job_id, idx),
+            )
+            if cur.rowcount == 0:
+                cur.close()
+                return False
+
+            cur.execute(
+                "SELECT text FROM job_segments WHERE job_id = ? ORDER BY idx",
+                (job_id,),
+            )
+            full_text = "\n".join(row["text"] for row in cur.fetchall())
+            cur.execute(
+                "UPDATE jobs SET text = ? WHERE id = ?",
+                (full_text, job_id),
+            )
+            cur.close()
+            return True
 
     def count_active(self) -> int:
         """

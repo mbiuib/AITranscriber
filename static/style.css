@@ -44,11 +44,11 @@ html, body {
 body {
   display: flex;
   flex-direction: column;
-  padding-bottom: 44px; /* место под консоль */
-  transition: padding-bottom .25s ease;
+  padding-bottom: 44px; /* место под свёрнутую консоль (только заголовок) */
+  transition: padding-bottom .28s cubic-bezier(.4,0,.2,1);
 }
 
-body.console-open { padding-bottom: 320px; }
+body.console-open { padding-bottom: min(320px, 45vh); }
 
 /* =============== Topbar =============== */
 .topbar {
@@ -403,11 +403,21 @@ body.console-open { padding-bottom: 320px; }
 .console {
   position: fixed;
   bottom: 0; left: 0; right: 0;
+  height: min(320px, 45vh);
   background: var(--bg-soft);
   border-top: 1px solid var(--border);
-  transition: transform .25s cubic-bezier(.4,0,.2,1);
+  /* По умолчанию консоль СВЁРНУТА — сдвинута вниз, виден только заголовок */
+  transform: translateY(calc(100% - 44px));
+  transition: transform .28s cubic-bezier(.4,0,.2,1);
   z-index: 100;
   box-shadow: 0 -8px 24px rgba(0,0,0,.25);
+  display: flex;
+  flex-direction: column;
+}
+
+/* Когда body имеет класс console-open — консоль разворачивается */
+body.console-open .console {
+  transform: translateY(0);
 }
 
 .console-header {
@@ -423,7 +433,6 @@ body.console-open { padding-bottom: 320px; }
 
 .console-title { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 600; }
 .console-chevron { font-size: 10px; transition: transform .25s; color: var(--text-dim); }
-.console-chevron.rotated { transform: rotate(-90deg); }
 
 .console-counter {
   font-size: 11px; font-weight: 600;
@@ -435,7 +444,7 @@ body.console-open { padding-bottom: 320px; }
 .console-actions { display: flex; gap: 4px; }
 
 .console-body {
-  height: 276px;
+  flex: 1;
   overflow-y: auto;
   padding: 8px 0;
   font-family: var(--mono);

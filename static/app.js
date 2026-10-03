@@ -13,7 +13,7 @@ const state = {
   text: "",
   metadata: {},
   running: false,
-  consoleOpen: false,
+  consoleOpen: true,
   logCount: 0,
 };
 
@@ -210,6 +210,12 @@ async function start() {
     $("#start-btn").disabled = false;
     $("#cancel-btn").disabled = true;
   }
+
+  if (!state.consoleOpen) {
+      state.consoleOpen = true;
+      document.body.classList.add("console-open");
+      $("#console-chevron").textContent = "▼";
+    }
 }
 
 async function cancel() {
@@ -591,11 +597,15 @@ function setupConsole() {
   const chevron = $("#console-chevron");
   const body = $("#console-body");
 
+  // Синхронизируем начальное состояние
+  document.body.classList.toggle("console-open", state.consoleOpen);
+  chevron.textContent = state.consoleOpen ? "▼" : "▲";
+
   header.addEventListener("click", (e) => {
     if (e.target.closest("button")) return;
     state.consoleOpen = !state.consoleOpen;
     document.body.classList.toggle("console-open", state.consoleOpen);
-    chevron.classList.toggle("rotated", !state.consoleOpen);
+    chevron.textContent = state.consoleOpen ? "▼" : "▲";
   });
 
   $("#console-clear").addEventListener("click", (e) => {

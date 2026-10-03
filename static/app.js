@@ -726,6 +726,7 @@ function handleEvent(ev) {
     case "done":     onDone(ev.text, ev.metadata); break;
     case "error":    onError(ev.message); break;
     case "cancelled": onCancelled(); break;
+    case "segments_replaced": onSegmentsReplaced(ev.segments); break;
   }
 }
 
@@ -744,6 +745,23 @@ function applySnapshot(snap) {
   if (snap.progress !== undefined) updateProgress(snap.progress, snap.message, snap.stage);
   updateStatus(snap.status, snap.message);
   if (snap.status === "done") onDone(snap.text, snap.metadata);
+}
+
+function onSegmentsReplaced(segments) {
+  if (!segments || !segments.length) return;
+
+  state.segments = [];
+  state.seenSegmentsCount = 0;
+  $("#result-content").innerHTML = '<div class="segments" id="segments"></div>';
+
+  for (const s of segments) {
+    appendSegment(s, true);
+  }
+  state.seenSegmentsCount = state.segments.length;
+  updateScrollButton();
+
+  toast("info", "group",
+    `Сегменты разбиты по спикерам: ${segments.length} фрагментов`);
 }
 
 /* ============================================================
@@ -826,12 +844,23 @@ function appendSegment(seg, silent = false) {
 
   const line = document.createElement("div");
   line.className = "segment" + (silent ? "" : " new-segment");
+
   const g = document.createElement("span");
   g.className = "gutter";
   g.textContent = formatTs(seg.start);
+
   const tx = document.createElement("span");
   tx.className = "text";
-  tx.textContent = seg.text;
+
+  if (seg.speaker) {
+    const chip = document.createElement("span");
+    chip.className = "speaker";
+    chip.textContent = speakerName(seg.speaker, null);
+    chip.style.setProperty("--speaker-color", speakerColor(seg.speaker));
+    tx.appendChild(chip);
+  }
+  tx.appendChild(document.createTextNode(seg.text));
+
   line.append(g, tx);
   wrap.appendChild(line);
 
@@ -860,6 +889,30 @@ function formatTs(sec) {
   return `${pad(h,2)}:${pad(m,2)}:${pad(ss,2)}`;
 }
 const pad = (n, l) => String(n).padStart(l, "0");
+
+const SPEAKER_COLORS = [
+  "#89b4fa", "#a6e3a1", "#f9e2af", "#f38ba8",
+  "#cba6f7", "#94e2d5", "#fab387", "#74c7ec",
+];
+
+function speakerColor(speaker) {
+  if (!speaker || speaker === "UNKNOWN") return "var(--text-3)";
+  let h = 0;
+  for (let i = 0; i < speaker.length; i++) {
+    h = (h * 31 + speaker.charCodeAt(i)) | 0;
+  }
+  return SPEAKER_COLORS[Math.abs(h) % SPEAKER_COLORS.length];
+}
+
+function speakerName(speaker, mapping) {
+  if (mapping && mapping[speaker]) return mapping[speaker];
+  if (!speaker || speaker === "UNKNOWN") return "—";
+  if (speaker.startsWith("SPEAKER_")) {
+    const idx = parseInt(speaker.split("_")[1], 10);
+    if (!isNaN(idx)) return `Спикер ${idx + 1}`;
+  }
+  return speaker;
+}
 
 function setupResultScroll() {
   const rc = $("#result-content");
@@ -960,7 +1013,11 @@ function resetResult() {
    ============================================================ */
 async function copyText() {
   if (!state.segments.length) return;
-  const txt = state.segments.map(s => s.text).join("\n");
+  const mapping = state.metadata?.speaker_names || {};
+  const txt = state.segments.map(s => {
+    const name = s.speaker ? speakerName(s.speaker, mapping) + ": " : "";
+    return name + s.text;
+  }).join("\n");
   await navigator.clipboard.writeText(txt);
   toast("success", "content_copy", t("toast.copied"));
 }
@@ -971,9 +1028,11 @@ function downloadTxt() {
 }
 
 function downloadSrt() {
-  const srt = state.segments.map((s, i) =>
-    `${i+1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.end)}\n${s.text}\n`
-  ).join("\n");
+  const mapping = state.metadata?.speaker_names || {};
+  const srt = state.segments.map((s, i) => {
+    const name = s.speaker ? speakerName(s.speaker, mapping) + ": " : "";
+    return `${i+1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.end)}\n${name}${s.text}\n`;
+  }).join("\n");
   downloadBlob(srt, baseName() + ".srt", "application/x-subrip");
 }
 
@@ -1793,6 +1852,7 @@ function renderDetail(snap) {
   renderDetailMeta(snap);
   renderDetailStats(snap);
   renderDetailNotes(snap);
+  renderDetailSpeakers(snap);
 }
 
 /**
@@ -1812,7 +1872,19 @@ function buildSegmentRow(seg) {
 
   const tx = document.createElement("span");
   tx.className = "text";
-  tx.textContent = seg.text;
+
+  if (seg.speaker) {
+    const mapping = state.detailJob?.metadata?.speaker_names || {};
+    const name = speakerName(seg.speaker, mapping);
+    const chip = document.createElement("span");
+    chip.className = "speaker";
+    chip.textContent = name;
+    chip.style.setProperty("--speaker-color", speakerColor(seg.speaker));
+    tx.appendChild(chip);
+  }
+
+  const textNode = document.createTextNode(seg.text);
+  tx.appendChild(textNode);
 
   line.append(g, tx);
 
@@ -1823,6 +1895,71 @@ function buildSegmentRow(seg) {
   });
 
   return line;
+}
+
+function renderDetailSpeakers(snap) {
+  const el = $("#detail-speakers");
+  const meta = snap.metadata || {};
+  const speakers = meta.speakers || [];
+  const mapping = meta.speaker_names || {};
+
+  if (!meta.diarization || !speakers.length) {
+    el.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon material-symbols-rounded">group_off</div>
+        <div class="empty-text">Диаризация не выполнялась</div>
+        <div class="empty-hint">Включите её в настройках и запустите транскрибацию заново</div>
+      </div>`;
+    return;
+  }
+
+  el.innerHTML = "";
+  for (const sp of speakers) {
+    const row = document.createElement("div");
+    row.className = "speaker-row";
+
+    const dot = document.createElement("span");
+    dot.className = "speaker-dot";
+    dot.style.background = speakerColor(sp);
+
+    const key = document.createElement("span");
+    key.className = "speaker-key";
+    key.textContent = sp;
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = mapping[sp] || speakerName(sp, null);
+    input.placeholder = "Имя спикера";
+
+    input.addEventListener("change", async () => {
+      const newName = input.value.trim();
+      if (!newName) {
+        input.value = mapping[sp] || speakerName(sp, null);
+        return;
+      }
+      try {
+        const r = await fetch(
+          `/api/jobs/${state.detailJob.id}/speakers/${encodeURIComponent(sp)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName }),
+          }
+        );
+        if (!r.ok) throw new Error((await r.json()).detail || "Ошибка");
+        const d = await r.json();
+        state.detailJob.metadata.speaker_names = d.speaker_names;
+        toast("success", "check_circle", "Имя сохранено");
+        // Перерисовываем транскрипт, чтобы обновлённые имена подхватились
+        renderDetail(state.detailJob);
+      } catch (e) {
+        toast("error", "error", e.message);
+      }
+    });
+
+    row.append(dot, key, input);
+    el.appendChild(row);
+  }
 }
 
 /**
@@ -2130,14 +2267,16 @@ function setupDetailModal() {
     downloadBlob(txt, snap.filename.replace(/\.[^.]+$/, "") + ".txt", "text/plain");
   });
 
-  $("#d-act-srt").addEventListener("click", () => {
-    const snap = state.detailJob;
-    if (!snap || !snap.segments) return;
-    const srt = snap.segments.map((s, i) =>
-      `${i+1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.end)}\n${s.text}\n`
-    ).join("\n");
-    downloadBlob(srt, snap.filename.replace(/\.[^.]+$/, "") + ".srt", "application/x-subrip");
-  });
+    $("#d-act-srt").addEventListener("click", () => {
+      const snap = state.detailJob;
+      if (!snap || !snap.segments) return;
+      const mapping = snap.metadata?.speaker_names || {};
+      const srt = snap.segments.map((s, i) => {
+        const name = s.speaker ? speakerName(s.speaker, mapping) + ": " : "";
+        return `${i+1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.end)}\n${name}${s.text}\n`;
+      }).join("\n");
+      downloadBlob(srt, snap.filename.replace(/\.[^.]+$/, "") + ".srt", "application/x-subrip");
+    });
 
   $("#d-act-json").addEventListener("click", () => {
     const snap = state.detailJob;

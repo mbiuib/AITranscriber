@@ -22,11 +22,11 @@ import time
 import traceback
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from .config import get_env, get_store
 from .jobs import Job
-from . import media_info
+from . import media_info, diarization
 
 SUPPORTED_AUDIO = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".wma", ".aac", ".opus"}
 SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".ts"}
@@ -41,6 +41,12 @@ MODEL_REPOS = {
     "large-v3":       "Systran/faster-whisper-large-v3",
     "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
 }
+
+# Максимальная длина одного сегмента Whisper. Дольше — режется
+# принудительно через _resplit_long_segments. 25 секунд — компромисс:
+# достаточно длинный для связной фразы, но не такой большой, чтобы
+# диаризация внутри сегмента теряла границы реплик.
+MAX_SEGMENT_SEC = 25.0
 
 
 def _fmt_bytes(n: float) -> str:
@@ -73,6 +79,57 @@ def _fmt_ts(seconds: float) -> str:
     td = timedelta(seconds=seconds)
     total = int(td.total_seconds())
     return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
+def _resplit_long_segments(
+    segments: List[Dict[str, Any]], max_sec: float = MAX_SEGMENT_SEC,
+) -> List[Dict[str, Any]]:
+    """
+    Режет слишком длинные сегменты Whisper на куски по max_sec.
+
+    Нужна как страховка: при плотной звуковой дорожке (музыка, эффекты)
+    VAD иногда не находит пауз, и Whisper выдаёт сегменты по 60-100
+    секунд. Параметр chunk_length в BatchedInferencePipeline управляет
+    только входным окном модели, но не длиной выходного сегмента.
+    Разрезание идёт по границам слов, чтобы не порвать фразу посередине.
+
+    Args:
+        segments: Сегменты Whisper с полями start, end, text, words.
+        max_sec: Максимальная длина одного сегмента в секундах.
+
+    Returns:
+        Новый список сегментов, каждый не длиннее max_sec.
+    """
+    out: List[Dict[str, Any]] = []
+    for s in segments:
+        dur = s["end"] - s["start"]
+        if dur <= max_sec or not s.get("words"):
+            out.append(s)
+            continue
+
+        bucket: List[Dict[str, Any]] = []
+        for w in s["words"]:
+            bucket.append(w)
+            if bucket[-1]["end"] - bucket[0]["start"] >= max_sec:
+                out.append({
+                    "start": bucket[0]["start"],
+                    "end": bucket[-1]["end"],
+                    "text": "".join(x["word"] for x in bucket).strip(),
+                    "words": list(bucket),
+                    "speaker": None,
+                })
+                bucket = []
+
+        if bucket:
+            out.append({
+                "start": bucket[0]["start"],
+                "end": bucket[-1]["end"],
+                "text": "".join(x["word"] for x in bucket).strip(),
+                "words": list(bucket),
+                "speaker": None,
+            })
+
+    return out
 
 
 def _ensure_model(job: Job, model: str) -> str:
@@ -134,8 +191,7 @@ def _ensure_model(job: Job, model: str) -> str:
 
         huggingface_hub создаёт tqdm-бары для каждого файла; мы
         перехватываем update() и публикуем процент через job.set_progress.
-        Дедупликация по _last нужна, чтобы не спамить событиями SSE —
-        tqdm вызывает update() очень часто.
+        Дедупликация по _last нужна, чтобы не спамить событиями SSE.
         """
         _last = -1
 
@@ -184,10 +240,6 @@ def _extract_audio(job: Job, video_path: str) -> str:
     Параметры (16 кГц, моно, PCM s16le) выбраны под требования Whisper:
     модель обучена именно на таких данных, и подготовка входа заранее
     через FFmpeg быстрее, чем пересэмплирование внутри модели.
-
-    Временный файл создаётся в системной temp-папке и удаляется
-    вызывающей стороной в блоке finally. Возвращаемый путь ведёт на
-    файл audio.wav внутри уникальной подпапки с префиксом "whisper_".
 
     Args:
         job: Задача, в которую публикуются логи.
@@ -242,7 +294,6 @@ def run(job: Job) -> None:
         model_name = job.model or settings["model"]
         language = job.language or (None if settings["language"] == "auto" else settings["language"])
 
-        # Сохраняем снимок настроек, использованных для этой задачи
         settings_snapshot = {
             "model": model_name,
             "language": language or "auto",
@@ -254,6 +305,9 @@ def run(job: Job) -> None:
             "compute_type": settings["compute_type"],
             "initial_prompt": settings["initial_prompt"],
             "hotwords": settings["hotwords"],
+            "diarization": settings.get("diarization"),
+            "min_speakers": settings.get("min_speakers"),
+            "max_speakers": settings.get("max_speakers"),
         }
         if job._repo:
             try:
@@ -264,7 +318,6 @@ def run(job: Job) -> None:
             except Exception:
                 pass
 
-        # Метаданные файла
         job.log("info", "Чтение метаданных файла…")
         src_meta = media_info.probe(job.file_path)
         if src_meta:
@@ -325,10 +378,16 @@ def run(job: Job) -> None:
             "batch_size": int(settings["batch_size"]),
             "beam_size": int(settings["beam_size"]),
             "vad_filter": bool(settings["vad"]),
-            "vad_parameters": dict(min_silence_duration_ms=500, speech_pad_ms=200),
+            "vad_parameters": dict(
+                min_silence_duration_ms=200,
+                speech_pad_ms=150,
+            ),
             "word_timestamps": True,
             "condition_on_previous_text": bool(settings["condition_on_previous"]),
             "temperature": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            "no_speech_threshold": 0.5,
+            "log_prob_threshold": -1.0,
+            "compression_ratio_threshold": 2.4,
         }
         if language:
             kwargs["language"] = language
@@ -337,26 +396,60 @@ def run(job: Job) -> None:
         if settings["hotwords"]:
             kwargs["hotwords"] = settings["hotwords"]
 
-        job.log("info", f"Параметры: batch={kwargs['batch_size']}, beam={kwargs['beam_size']}, "
-                        f"vad={kwargs['vad_filter']}, lang={language or 'auto'}")
+        job.log("info",
+            f"Параметры: batch={kwargs['batch_size']}, "
+            f"beam={kwargs['beam_size']}, "
+            f"vad={kwargs['vad_filter']}, "
+            f"lang={language or 'auto'}, "
+            f"cond_prev={kwargs['condition_on_previous_text']}, "
+            f"no_speech={kwargs['no_speech_threshold']}, "
+            f"log_prob={kwargs['log_prob_threshold']}")
 
         t_start = time.time()
-        segments, info = batched.transcribe(audio_path, **kwargs)
+
+        # BatchedInferencePipeline требует vad_filter=True — без VAD он
+        # не может собрать батч и падает с "No clip timestamps found".
+        # При отключённом VAD используем обычный transcribe — медленнее,
+        # но работает без ограничений.
+        if kwargs.get("vad_filter"):
+            segments, info = batched.transcribe(audio_path, **kwargs)
+        else:
+            job.log("warn", "VAD отключён — использую обычный режим (медленнее)")
+            segments, info = model.transcribe(audio_path, **kwargs)
 
         total_duration = getattr(info, "duration", 0) or 0
         job.log("info", f"Язык: {info.language} ({info.language_probability:.0%})")
         job.log("info", f"Длительность: {_fmt_ts(total_duration)}")
 
         text_parts = []
+        seg_words_all: List[Dict[str, Any]] = []
         peak_vram = 0
+
         for i, seg in enumerate(segments):
             if job.is_cancelled():
                 raise InterruptedError()
             text = seg.text.strip()
             if not text:
                 continue
+
+            words: List[Dict[str, Any]] = []
+            for w in (getattr(seg, "words", None) or []):
+                words.append({
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    "word": str(w.word),
+                })
+
             job.add_segment(seg.start, seg.end, text)
             text_parts.append(text)
+
+            seg_words_all.append({
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": text,
+                "words": words,
+                "speaker": None,
+            })
 
             if i % 20 == 0:
                 peak_vram = max(peak_vram, _get_gpu_used_mb())
@@ -371,13 +464,107 @@ def run(job: Job) -> None:
                 "transcribing",
             )
 
+        # Разрезаем длинные сегменты — защита от VAD-провалов
+        before = len(seg_words_all)
+        seg_words_all = _resplit_long_segments(seg_words_all, MAX_SEGMENT_SEC)
+        if len(seg_words_all) != before:
+            job.log("info",
+                f"Сегментов Whisper: {before} → {len(seg_words_all)} "
+                f"после разрезания до {int(MAX_SEGMENT_SEC)} с")
+        else:
+            job.log("info", f"Сегментов Whisper: {len(seg_words_all)}")
+
+        speakers: List[str] = []
+        speaker_map: Dict[str, str] = {}
+
+        if settings.get("diarization"):
+            if not diarization.is_available():
+                job.log("warn", "pyannote.audio не установлен — диаризация пропущена")
+            else:
+                job.set_status("diarizing", "Диаризация спикеров…")
+                job.set_progress(96, "Диаризация…", "diarizing")
+                job.log("info", "Запуск диаризации (pyannote.audio)")
+
+                try:
+                    del batched
+                    del model
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+                min_sp = int(settings.get("min_speakers") or 0) or None
+                max_sp = int(settings.get("max_speakers") or 0) or None
+                job.log("info", f"Ограничения спикеров: min={min_sp}, max={max_sp}")
+
+                try:
+                    t_diar = time.time()
+                    turns = diarization.run(
+                        audio_path,
+                        min_speakers=min_sp,
+                        max_speakers=max_sp,
+                        log=lambda lvl, msg: job.log(lvl, msg),
+                    )
+                    job.log("success", f"Диаризация заняла {time.time() - t_diar:.1f} с")
+
+                    job.log("info", "Разбиение сегментов по спикерам…")
+                    split = diarization.split_segments_by_speaker(
+                        seg_words_all, turns,
+                        min_segment_duration=1.0,
+                        merge_gap=1.5,
+                        no_split_below=3.0,
+                    )
+
+                    if split:
+                        if job._repo:
+                            try:
+                                job._repo.replace_segments(job.id, split)
+                            except Exception as e:
+                                job.log("warn", f"Не удалось заменить сегменты: {e}")
+
+                        job.segments = [
+                            {
+                                "index": s["index"],
+                                "start": s["start"],
+                                "end": s["end"],
+                                "text": s["text"],
+                                "speaker": s["speaker"],
+                            }
+                            for s in split
+                        ]
+                        job.text = "\n".join(s["text"] for s in job.segments)
+
+                        for s in split:
+                            sp = s["speaker"]
+                            if sp not in speaker_map:
+                                speaker_map[sp] = diarization.format_speaker(sp)
+                        speakers = sorted(speaker_map.keys())
+
+                        job.log("success",
+                                f"Сегментов после разбиения: {len(split)}, "
+                                f"спикеров: {len(speakers)}")
+
+                        job.emit({
+                            "type": "segments_replaced",
+                            "segments": job.segments,
+                        })
+
+                except Exception as e:
+                    job.log("error", f"Диаризация не удалась: {e}")
+                    speakers = []
+                    speaker_map = {}
+                finally:
+                    diarization.unload_pipeline()
+
         proc_time = time.time() - t_start
         stats["stages"]["transcribe"] = round(proc_time, 2)
         stats["peak_vram_mb"] = peak_vram
         stats["total_seconds"] = round(time.time() - stats["started_at"], 2)
         stats["rtf"] = round(proc_time / max(total_duration, 0.01), 3)
 
-        job.text = "\n".join(text_parts)
+        if not job.text:
+            job.text = "\n".join(text_parts)
         job.metadata = {
             "language": getattr(info, "language", "?"),
             "language_probability": getattr(info, "language_probability", 0),
@@ -386,6 +573,9 @@ def run(job: Job) -> None:
             "model": model_name,
             "processing_time": proc_time,
             "speed_factor": round(total_duration / max(proc_time, 0.01), 2),
+            "diarization": bool(speakers),
+            "speakers": speakers,
+            "speaker_names": speaker_map,
         }
         if job._repo:
             try:
@@ -437,6 +627,10 @@ def run(job: Job) -> None:
         job.persist_final()
         job.emit({"type": "error", "message": err})
     finally:
+        try:
+            diarization.unload_pipeline()
+        except Exception:
+            pass
         if temp_audio and os.path.exists(temp_audio):
             try:
                 os.remove(temp_audio)

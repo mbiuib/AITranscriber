@@ -44,7 +44,13 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
     "transcription.condition_on_previous": {
         "type": "bool",
         "label": "Учитывать предыдущий текст", "group": "transcription", "order": 6,
-        "hint": "Помогает при смешанной речи (русский + английские термины)",
+        "hint": "Помогает при смешанной речи (русский + английские термины). "
+                "⚠️ Может вызывать галлюцинации на музыке и шуме.",
+    },
+    "transcription.diarization": {
+        "type": "bool",
+        "label": "Диаризация спикеров", "group": "transcription", "order": 7,
+        "hint": "Определять, кто говорил. Требует HF_TOKEN и принятия условий pyannote.",
     },
     "transcription.device": {
         "type": "select", "options": ["cuda", "cpu"],
@@ -57,12 +63,23 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
     "transcription.initial_prompt": {
         "type": "text",
         "label": "Начальный промпт", "group": "advanced", "order": 3,
-        "hint": "Задаёт контекст. Помогает распознавать специфичные термины.",
+        "hint": "⚠️ Оставьте пустым, если в аудио есть музыка или шум — "
+                "иначе Whisper начнёт повторять промпт в тишине.",
     },
     "transcription.hotwords": {
         "type": "text",
         "label": "Слова-подсказки", "group": "advanced", "order": 4,
         "hint": "Имена, термины через запятую",
+    },
+    "transcription.min_speakers": {
+        "type": "int", "min": 0, "max": 50,
+        "label": "Мин. спикеров (0 — автодетект)", "group": "advanced", "order": 5,
+        "hint": "Если знаете примерное число участников — задайте, "
+                "это сильно повышает точность pyannote.",
+    },
+    "transcription.max_speakers": {
+        "type": "int", "min": 0, "max": 50,
+        "label": "Макс. спикеров (0 — автодетект)", "group": "advanced", "order": 6,
     },
     "server.max_upload_mb": {
         "type": "int", "min": 1, "max": 102400,
@@ -123,7 +140,11 @@ class EnvSettings(BaseSettings):
         default_condition_on_previous: Учитывать ли предыдущий текст.
         default_initial_prompt: Начальный промпт по умолчанию.
         default_hotwords: Слова-подсказки по умолчанию.
+        diarization_enabled: Включена ли диаризация по умолчанию.
+        diarization_min_speakers: Минимум спикеров по умолчанию.
+        diarization_max_speakers: Максимум спикеров по умолчанию.
         max_upload_mb: Максимальный размер загружаемого файла в МБ.
+        max_parallel_jobs: Сколько задач обрабатывать одновременно.
         max_workers: Параллельных HTTP-загрузок при скачивании моделей.
         retention_hours: Сколько часов хранить завершённые задачи.
         cleanup_interval_min: Период фоновой очистки в минутах.
@@ -159,12 +180,16 @@ class EnvSettings(BaseSettings):
     default_compute_type: str = "float16"
     default_device: str = "cuda"
     default_beam_size: int = 5
-    default_condition_on_previous: bool = True
-    default_initial_prompt: str = (
-        "Это совещание на русском языке. Используются технические термины "
-        "на английском: Kubernetes, Docker, REST API, CI/CD, JavaScript, Python."
-    )
+    default_condition_on_previous: bool = False
+    # Пустой промпт: защита от галлюцинаций Whisper на музыке и шуме.
+    # Если нужен специализированный контекст — задайте его в UI,
+    # но помните про риск повторения промпта в тишине.
+    default_initial_prompt: str = ""
     default_hotwords: str = ""
+
+    diarization_enabled: bool = False
+    diarization_min_speakers: int = 0
+    diarization_max_speakers: int = 0
 
     max_upload_mb: int = 4096
     max_parallel_jobs: int = 1
@@ -316,6 +341,9 @@ class SettingsStore:
             "transcription.compute_type": env.default_compute_type,
             "transcription.initial_prompt": env.default_initial_prompt,
             "transcription.hotwords": env.default_hotwords,
+            "transcription.diarization": env.diarization_enabled,
+            "transcription.min_speakers": env.diarization_min_speakers,
+            "transcription.max_speakers": env.diarization_max_speakers,
             "server.max_upload_mb": env.max_upload_mb,
             "server.max_parallel_jobs": env.max_parallel_jobs,
             "server.retention_hours": env.retention_hours,
@@ -409,7 +437,7 @@ class SettingsStore:
         Returns:
             Словарь параметров транскрибации: model, language, batch_size,
             beam_size, vad, condition_on_previous, device, compute_type,
-            initial_prompt, hotwords.
+            initial_prompt, hotwords, diarization, min_speakers, max_speakers.
         """
         return {
             "model": self.get("transcription.model"),
@@ -422,6 +450,9 @@ class SettingsStore:
             "compute_type": self.get("transcription.compute_type"),
             "initial_prompt": self.get("transcription.initial_prompt"),
             "hotwords": self.get("transcription.hotwords"),
+            "diarization": self.get("transcription.diarization"),
+            "min_speakers": self.get("transcription.min_speakers"),
+            "max_speakers": self.get("transcription.max_speakers"),
         }
 
 
@@ -483,6 +514,7 @@ def apply_env_vars() -> None:
 
 
 _repo_singleton = None
+
 
 def get_repository():
     """

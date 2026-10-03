@@ -806,6 +806,58 @@ async def update_segment(
     return {"ok": True, "text": full_text}
 
 
+@app.patch(
+    "/api/jobs/{job_id}/speakers/{speaker}",
+    tags=["jobs"],
+    summary="Переименовать спикера",
+    description="Меняет отображаемое имя спикера во всех сегментах задачи. "
+                "Хранится в metadata.speaker_names.",
+)
+async def rename_speaker(
+    job_id: str, speaker: str, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Переименовывает спикера во всех сегментах задачи.
+
+    Args:
+        job_id: Идентификатор задачи.
+        speaker: Исходный идентификатор (SPEAKER_00).
+        payload: {"name": "Новое имя"}.
+
+    Returns:
+        {"ok": True, "speaker_names": {...}}.
+
+    Raises:
+        HTTPException: 400 — некорректный payload;
+                       404 — задача не найдена.
+    """
+    if not isinstance(payload, dict) or "name" not in payload:
+        raise HTTPException(400, "Ожидается {'name': str}")
+    name = str(payload["name"]).strip()[:64]
+    if not name:
+        raise HTTPException(400, "Имя не может быть пустым")
+
+    jm = get_job_manager()
+    snap = jm.get_snapshot(job_id)
+    if not snap:
+        raise HTTPException(404, "Задача не найдена")
+
+    meta = snap.get("metadata") or {}
+    speaker_names = meta.get("speaker_names", {})
+    speaker_names[speaker] = name
+    meta["speaker_names"] = speaker_names
+
+    repo = get_repository()
+    repo.update_job(job_id, metadata=json.dumps(meta, ensure_ascii=False))
+
+    # Обновляем активную задачу в памяти
+    active = jm.get(job_id)
+    if active:
+        active.metadata = meta
+
+    return {"ok": True, "speaker_names": speaker_names}
+
+
 @app.get("/api/jobs/{job_id}", tags=["jobs"], summary="Полный снимок задачи")
 async def get_job(job_id: str) -> Dict[str, Any]:
     """Возвращает полный снимок задачи из памяти или из БД."""
@@ -1019,6 +1071,44 @@ async def get_result(job_id: str) -> Dict[str, Any]:
         "segments": snap.get("segments", []),
         "metadata": snap.get("metadata", {}),
     }
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    """
+    Инициализирует репозиторий, очередь задач и фоновую очистку.
+
+    Порядок важен: сначала помечаем прерванные задачи, потом создаём
+    JobManager, потом инициализируем очередь — она вызывает
+    get_job_manager() при первом же воркере.
+    """
+    env.upload_dir.mkdir(parents=True, exist_ok=True)
+    env.models_dir.mkdir(parents=True, exist_ok=True)
+
+    repo = get_repository()
+    interrupted = repo.mark_interrupted()
+    if interrupted:
+        print(f"[startup] Помечено прерванных задач: {interrupted}")
+
+    init_job_manager(repo=repo)
+
+    jm = get_job_manager()
+    max_parallel = int(store.get("server.max_parallel_jobs"))
+    init_task_queue(
+        get_job=lambda jid: jm.get(jid),
+        run_job=transcribe.run,
+        max_parallel=max_parallel,
+    )
+
+    # Логируем активные настройки при старте
+    print("[startup] Активные настройки транскрибации:")
+    for key, value in store.as_dict_for_worker().items():
+        print(f"    {key} = {value!r}")
+    print(f"    settings.json: {env.settings_file} "
+          f"({'exists' if env.settings_file.exists() else 'empty'})")
+    print(f"[startup] Очередь задач: параллелизм = {max_parallel}")
+
+    threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
 app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")

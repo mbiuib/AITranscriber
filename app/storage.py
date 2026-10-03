@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 class JobRepository:
@@ -172,6 +172,11 @@ class JobRepository:
             "ON jobs(starred) WHERE starred = 1"
         )
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+        cur.execute("PRAGMA table_info(job_segments)")
+        seg_cols = {row["name"] for row in cur.fetchall()}
+        if "speaker" not in seg_cols:
+            cur.execute("ALTER TABLE job_segments ADD COLUMN speaker TEXT")
 
     def create_job(self, job: Dict[str, Any]) -> None:
         """
@@ -343,8 +348,10 @@ class JobRepository:
             )
             cur.close()
 
-    def append_segment(self, job_id: str, idx: int, start: float,
-                       end: float, text: str) -> None:
+    def append_segment(
+            self, job_id: str, idx: int, start: float, end: float,
+            text: str, speaker: Optional[str] = None,
+    ) -> None:
         """
         Добавляет сегмент транскрибации.
 
@@ -354,13 +361,14 @@ class JobRepository:
             start: Начало сегмента в секундах.
             end: Конец сегмента в секундах.
             text: Распознанный текст.
+            speaker: Идентификатор спикера или None.
         """
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "INSERT INTO job_segments (job_id, idx, start, end, text) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, idx, start, end, text),
+                "INSERT INTO job_segments (job_id, idx, start, end, text, speaker) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, idx, start, end, text, speaker),
             )
             cur.close()
 
@@ -506,7 +514,8 @@ class JobRepository:
             job["logs"] = [dict(r) for r in cur.fetchall()]
 
             cur.execute(
-                "SELECT idx, start, end, text FROM job_segments WHERE job_id = ? ORDER BY idx",
+                "SELECT idx, start, end, text, speaker FROM job_segments "
+                "WHERE job_id = ? ORDER BY idx",
                 (job_id,),
             )
             job["segments"] = [
@@ -515,6 +524,7 @@ class JobRepository:
                     "start": row["start"],
                     "end": row["end"],
                     "text": row["text"],
+                    "speaker": row["speaker"],
                 }
                 for row in cur.fetchall()
             ]
@@ -697,6 +707,93 @@ class JobRepository:
             )
             cur.close()
             return True
+
+    def update_segment_speaker(self, job_id: str, idx: int, speaker: str) -> bool:
+        """
+        Обновляет спикера для одного сегмента.
+
+        Args:
+            job_id: Идентификатор задачи.
+            idx: Индекс сегмента.
+            speaker: Новый идентификатор спикера.
+
+        Returns:
+            True, если сегмент найден и обновлён.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE job_segments SET speaker = ? WHERE job_id = ? AND idx = ?",
+                (speaker, job_id, idx),
+            )
+            affected = cur.rowcount
+            cur.close()
+            return affected > 0
+
+    def replace_segments(
+        self, job_id: str, segments: List[Dict[str, Any]],
+    ) -> int:
+        """
+        Заменяет все сегменты задачи новым списком.
+
+        Используется после диаризации: старые сегменты (по фразам Whisper)
+        удаляются, на их место вставляются новые — разбитые по спикерам.
+
+        Args:
+            job_id: Идентификатор задачи.
+            segments: Новые сегменты с полями index, start, end, text, speaker.
+
+        Returns:
+            Количество вставленных сегментов.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM job_segments WHERE job_id = ?", (job_id,))
+
+            for s in segments:
+                cur.execute(
+                    "INSERT INTO job_segments "
+                    "(job_id, idx, start, end, text, speaker) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job_id, s["index"], s["start"], s["end"],
+                        s["text"], s.get("speaker"),
+                    ),
+                )
+
+            full_text = "\n".join(s["text"] for s in segments)
+            cur.execute(
+                "UPDATE jobs SET text = ? WHERE id = ?",
+                (full_text, job_id),
+            )
+
+            cur.close()
+            return len(segments)
+
+    def update_speaker_name(self, job_id: str, old: str, new: str) -> int:
+        """
+        Переименовывает спикера во всех сегментах задачи.
+
+        Используется при ручном переименовании «Спикер 1» → «Иван».
+
+        Args:
+            job_id: Идентификатор задачи.
+            old: Старое имя.
+            new: Новое имя.
+
+        Returns:
+            Количество обновлённых сегментов.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE job_segments SET speaker = ? "
+                "WHERE job_id = ? AND speaker = ?",
+                (new, job_id, old),
+            )
+            affected = cur.rowcount
+            cur.close()
+            return affected
 
     def count_active(self) -> int:
         """

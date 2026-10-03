@@ -51,6 +51,7 @@
   "stage.cancelled": "Отменено",
   "stage.interrupted": "Прервано",
   "stage.queued": "В очереди",
+  "stage.diarizing": "Диаризация",
 
   "nav.dashboard": "Дашборд",
   "dashboard.title": "Дашборд",

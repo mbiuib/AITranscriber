@@ -2567,3 +2567,61 @@ textarea::-webkit-scrollbar-corner {
   .bulk-buttons .btn { flex: 1; justify-content: center; padding: 8px 10px; font-size: 12px; }
   .bulk-buttons .btn span:not(.material-symbols-rounded) { display: none; }
 }
+
+/* ============================================================
+   Speaker chips + editor
+   ============================================================ */
+.segment .speaker {
+  display: inline-block;
+  margin-right: 8px;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: .3px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--speaker-color, var(--accent)) 15%, transparent);
+  color: var(--speaker-color, var(--accent));
+  vertical-align: middle;
+}
+
+.speakers-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 520px;
+}
+.speaker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.speaker-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.speaker-key {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.speaker-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-3);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  color: var(--text-1);
+  font-size: 13px;
+}
+.speaker-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+}

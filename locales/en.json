@@ -51,6 +51,7 @@
   "stage.cancelled": "Cancelled",
   "stage.interrupted": "Interrupted",
   "stage.queued": "Queued",
+  "stage.diarizing": "Diarization",
 
   "nav.dashboard": "Dashboard",
   "dashboard.title": "Dashboard",

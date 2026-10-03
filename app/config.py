@@ -21,14 +21,16 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
     "transcription.engine": {
         "type": "select",
         "options": ["whisper", "moss"],
-        "label": "Движок транскрибации", "group": "transcription", "order": 0,
+        "label": "Движок", "group": "transcription", "order": 0,
         "hint": "whisper — Whisper + Pyannote (раздельно). "
                 "moss — MOSS-Transcribe-Diarize (end-to-end).",
     },
     "transcription.model": {
         "type": "select",
-        "options": ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"],
+        "options": ["tiny", "base", "small", "medium",
+                    "large-v2", "large-v3", "large-v3-turbo"],
         "label": "Модель", "group": "transcription", "order": 1,
+        "engine": "whisper",
     },
     "transcription.language": {
         "type": "select",
@@ -39,25 +41,31 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
         "type": "int", "min": 1, "max": 32,
         "label": "Batch size", "group": "transcription", "order": 3,
         "hint": "Больше — быстрее, но требует больше VRAM",
+        "engine": "whisper",
     },
     "transcription.beam_size": {
         "type": "int", "min": 1, "max": 10,
         "label": "Beam size", "group": "transcription", "order": 4,
+        "engine": "whisper",
     },
     "transcription.vad": {
         "type": "bool",
         "label": "VAD-фильтрация", "group": "transcription", "order": 5,
+        "engine": "whisper",
     },
     "transcription.condition_on_previous": {
         "type": "bool",
         "label": "Учитывать предыдущий текст", "group": "transcription", "order": 6,
-        "hint": "Помогает при смешанной речи (русский + английские термины). "
+        "hint": "Помогает при смешанной речи. "
                 "⚠️ Может вызывать галлюцинации на музыке и шуме.",
+        "engine": "whisper",
     },
     "transcription.diarization": {
         "type": "bool",
         "label": "Диаризация спикеров", "group": "transcription", "order": 7,
-        "hint": "Определять, кто говорил. Требует HF_TOKEN и принятия условий pyannote.",
+        "hint": "Определять, кто говорил. Требует HF_TOKEN и принятия условий pyannote. "
+                "В MOSS диаризация встроена и работает всегда.",
+        "engine": "whisper",
     },
     "transcription.device": {
         "type": "select", "options": ["cuda", "cpu"],
@@ -70,23 +78,46 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
     "transcription.initial_prompt": {
         "type": "text",
         "label": "Начальный промпт", "group": "advanced", "order": 3,
-        "hint": "⚠️ Оставьте пустым, если в аудио есть музыка или шум — "
-                "иначе Whisper начнёт повторять промпт в тишине.",
+        "hint": "⚠️ Оставьте пустым, если в аудио есть музыка или шум. "
+                "Только для whisper.",
+        "engine": "whisper",
     },
     "transcription.hotwords": {
         "type": "text",
         "label": "Слова-подсказки", "group": "advanced", "order": 4,
-        "hint": "Имена, термины через запятую",
+        "hint": "Имена, термины через запятую. Работает и в whisper, и в moss.",
     },
     "transcription.min_speakers": {
         "type": "int", "min": 0, "max": 50,
         "label": "Мин. спикеров (0 — автодетект)", "group": "advanced", "order": 5,
-        "hint": "Если знаете примерное число участников — задайте, "
-                "это сильно повышает точность pyannote.",
+        "hint": "Только для whisper+pyannote.",
+        "engine": "whisper",
     },
     "transcription.max_speakers": {
         "type": "int", "min": 0, "max": 50,
         "label": "Макс. спикеров (0 — автодетект)", "group": "advanced", "order": 6,
+        "engine": "whisper",
+    },
+    "transcription.moss_chunk_duration": {
+        "type": "int", "min": 60, "max": 1800,
+        "label": "MOSS: размер чанка (сек)", "group": "advanced", "order": 7,
+        "hint": "300 (5 мин) — безопасно для 16 ГБ VRAM. "
+                "180 для 8 ГБ, 600 для 24+ ГБ.",
+        "engine": "moss",
+    },
+    "transcription.moss_chunk_overlap": {
+        "type": "int", "min": 0, "max": 30,
+        "label": "MOSS: перехлёст чанков (сек)", "group": "advanced", "order": 8,
+        "hint": "2 секунды — чтобы не терять слова на границах. "
+                "Увеличение замедляет, но уменьшает риск обрыва фразы.",
+        "engine": "moss",
+    },
+    "transcription.moss_max_new_tokens": {
+        "type": "int", "min": 512, "max": 16384,
+        "label": "MOSS: макс. токенов на чанк", "group": "advanced", "order": 9,
+        "hint": "4096 достаточно для 5-минутного чанка. "
+                "Больше — под длинные чанки, но растёт VRAM.",
+        "engine": "moss",
     },
     "server.max_upload_mb": {
         "type": "int", "min": 1, "max": 102400,
@@ -95,12 +126,12 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
     "server.max_parallel_jobs": {
         "type": "int", "min": 1, "max": 16,
         "label": "Одновременных задач", "group": "server", "order": 0,
-        "hint": "1 — строго по одной (FIFO), 2+ — параллельная обработка",
+        "hint": "1 — строго по одной (FIFO), 2+ — параллельная обработка. "
+                "Для MOSS рекомендуется 1.",
     },
     "server.retention_hours": {
         "type": "int", "min": 1, "max": 8760,
         "label": "Хранить результаты (часов)", "group": "server", "order": 2,
-        "hint": "Файлы и результаты старше указанного времени удаляются автоматически",
     },
     "server.cleanup_interval_min": {
         "type": "int", "min": 1, "max": 1440,
@@ -166,8 +197,6 @@ class EnvSettings(BaseSettings):
         case_sensitive=False,
     )
 
-    default_engine: str = "whisper"
-
     hf_token: str = ""
     hf_transfer: bool = True
     hf_download_timeout: int = 30
@@ -182,6 +211,7 @@ class EnvSettings(BaseSettings):
     log_level: str = "info"
     cors_origins: str = "*"
 
+    default_engine: str = "whisper"
     default_model: str = "large-v3"
     default_language: str = "ru"
     default_batch_size: int = 8
@@ -199,6 +229,10 @@ class EnvSettings(BaseSettings):
     diarization_enabled: bool = False
     diarization_min_speakers: int = 0
     diarization_max_speakers: int = 0
+
+    moss_chunk_duration: int = 300
+    moss_chunk_overlap: int = 2
+    moss_max_new_tokens: int = 4096
 
     max_upload_mb: int = 4096
     max_parallel_jobs: int = 1
@@ -354,6 +388,9 @@ class SettingsStore:
             "transcription.diarization": env.diarization_enabled,
             "transcription.min_speakers": env.diarization_min_speakers,
             "transcription.max_speakers": env.diarization_max_speakers,
+            "transcription.moss_chunk_duration": env.moss_chunk_duration,
+            "transcription.moss_chunk_overlap": env.moss_chunk_overlap,
+            "transcription.moss_max_new_tokens": env.moss_max_new_tokens,
             "server.max_upload_mb": env.max_upload_mb,
             "server.max_parallel_jobs": env.max_parallel_jobs,
             "server.retention_hours": env.retention_hours,
@@ -464,6 +501,9 @@ class SettingsStore:
             "diarization": self.get("transcription.diarization"),
             "min_speakers": self.get("transcription.min_speakers"),
             "max_speakers": self.get("transcription.max_speakers"),
+            "moss_chunk_duration": self.get("transcription.moss_chunk_duration"),
+            "moss_chunk_overlap": self.get("transcription.moss_chunk_overlap"),
+            "moss_max_new_tokens": self.get("transcription.moss_max_new_tokens"),
         }
 
 

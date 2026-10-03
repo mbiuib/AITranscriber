@@ -271,22 +271,41 @@ def run(job: Job) -> None:
     """
     Диспетчер транскрибации.
 
-    Выбирает движок на основе настройки transcription.engine:
-    whisper — Whisper + Pyannote (текущий пайплайн);
-    moss — MOSS-Transcribe-Diarize (end-to-end).
+    Выбирает движок в порядке приоритета:
+      1. job.engine — движок, выбранный при создании конкретной задачи;
+      2. transcription.engine из глобальных настроек;
+      3. "whisper" — безопасный дефолт.
+
+    Если выбран moss, но пакет не установлен — падаем с явной ошибкой,
+    а не откатываемся молча на whisper.
 
     Args:
         job: Задача со всеми параметрами обработки.
     """
     settings = get_store().as_dict_for_worker()
-    engine = settings.get("engine") or "whisper"
+    engine = job.engine or settings.get("engine") or "whisper"
+
+    job.log("info", f"Движок транскрибации: {engine}")
 
     if engine == "moss":
         if not moss_transcribe.is_available():
-            job.log("warn", "MOSS не установлен, откат на Whisper + Pyannote")
-            _run_whisper(job)
-        else:
-            moss_transcribe.run(job)
+            msg = (
+                "Выбран движок 'moss', но пакет moss_transcribe_diarize "
+                "не установлен. Установите его:\n"
+                "  git clone https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git\n"
+                "  cd MOSS-Transcribe-Diarize\n"
+                "  pip install -e .\n"
+                "Затем перезапустите сервер. Либо переключитесь на "
+                "движок 'whisper' в настройках."
+            )
+            job.error = msg
+            job.set_status("error", "MOSS не установлен")
+            job.log("error", msg)
+            job.finished_at = time.time()
+            job.persist_final()
+            job.emit({"type": "error", "message": msg})
+            return
+        moss_transcribe.run(job)
     else:
         _run_whisper(job)
 
@@ -317,6 +336,7 @@ def _run_whisper(job: Job) -> None:
         language = job.language or (None if settings["language"] == "auto" else settings["language"])
 
         settings_snapshot = {
+            "engine": "whisper",
             "model": model_name,
             "language": language or "auto",
             "batch_size": settings["batch_size"],
@@ -593,6 +613,7 @@ def _run_whisper(job: Job) -> None:
             "duration": total_duration,
             "segments_count": len(job.segments),
             "model": model_name,
+            "engine": "whisper",
             "processing_time": proc_time,
             "speed_factor": round(total_duration / max(proc_time, 0.01), 2),
             "diarization": bool(speakers),

@@ -42,14 +42,11 @@ ALL_SUPPORTED = SUPPORTED_AUDIO | SUPPORTED_VIDEO
 MODEL_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 MODEL_REVISION = "main"
 
-# Размер чанка в секундах. 300 (5 минут) — безопасно для 16 ГБ VRAM.
-# Для больших GPU можно увеличить до 600 (10 минут).
-CHUNK_DURATION_SEC = 300.0
-CHUNK_OVERLAP_SEC = 2.0
-
-# Ограничение на длину выходного текста за один проход.
-# 4096 токенов ≈ 5 минут транскрибации, достаточно для одного чанка.
-MAX_NEW_TOKENS = 4096
+# Дефолтные значения на случай отсутствия настроек в store.
+# Все три параметра вынесены в UI → Настройки → Advanced (при engine=moss).
+DEFAULT_CHUNK_DURATION = 300
+DEFAULT_CHUNK_OVERLAP = 2
+DEFAULT_MAX_NEW_TOKENS = 4096
 
 _model = None
 _processor = None
@@ -213,8 +210,8 @@ def _extract_audio(job: Job, video_path: str) -> str:
 
 def _split_audio(
     audio_path: str,
-    chunk_sec: float = CHUNK_DURATION_SEC,
-    overlap_sec: float = CHUNK_OVERLAP_SEC,
+    chunk_sec: float = DEFAULT_CHUNK_DURATION,
+    overlap_sec: float = DEFAULT_CHUNK_OVERLAP,
 ) -> List[Tuple[str, float]]:
     """
     Разбивает аудио на чанки через ffmpeg.
@@ -658,13 +655,33 @@ def run(job: Job) -> None:
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
 
+        # Читаем параметры чанкинга из настроек
+        chunk_sec = int(settings.get("moss_chunk_duration") or DEFAULT_CHUNK_DURATION)
+        overlap_sec = int(settings.get("moss_chunk_overlap") or DEFAULT_CHUNK_OVERLAP)
+        max_tokens = int(settings.get("moss_max_new_tokens") or DEFAULT_MAX_NEW_TOKENS)
+
+        # Защита от неверных значений
+        if chunk_sec < 60:
+            chunk_sec = DEFAULT_CHUNK_DURATION
+        if overlap_sec < 0:
+            overlap_sec = DEFAULT_CHUNK_OVERLAP
+        if overlap_sec >= chunk_sec:
+            overlap_sec = DEFAULT_CHUNK_OVERLAP
+        if max_tokens < 512:
+            max_tokens = DEFAULT_MAX_NEW_TOKENS
+
+        job.log("info",
+                f"Параметры MOSS: чанк {chunk_sec} с, "
+                f"перехлёст {overlap_sec} с, "
+                f"max_tokens {max_tokens}")
+
         # Разбиение на чанки
         total_dur = _get_audio_duration(audio_path)
-        if total_dur > CHUNK_DURATION_SEC:
+        if total_dur > chunk_sec:
             job.log("info",
-                f"Аудио {_fmt_ts(total_dur)} — разбиваю на чанки "
-                f"по {int(CHUNK_DURATION_SEC)} с")
-            chunks = _split_audio(audio_path)
+                    f"Аудио {_fmt_ts(total_dur)} — разбиваю на чанки "
+                    f"по {chunk_sec} с")
+            chunks = _split_audio(audio_path, chunk_sec, overlap_sec)
         else:
             chunks = [(audio_path, 0.0)]
 
@@ -676,15 +693,16 @@ def run(job: Job) -> None:
         all_segments: List[Dict[str, Any]] = []
         speakers_set: set = set()
         proc_time_total = 0.0
+        total_chunks = len(chunks)
 
         for ci, (chunk_path, offset) in enumerate(chunks):
             if job.is_cancelled():
                 raise InterruptedError()
 
-            pct = 35 + int((ci / len(chunks)) * 60)
+            pct = 35 + int((ci / total_chunks) * 60)
             job.set_progress(
                 pct,
-                f"Чанк {ci + 1}/{len(chunks)}…",
+                f"Чанк {ci + 1}/{total_chunks}: подготовка…",
                 "transcribing",
             )
 
@@ -706,7 +724,7 @@ def run(job: Job) -> None:
             t_chunk = time.time()
             result = generate_transcription(
                 model, processor, messages,
-                max_new_tokens=MAX_NEW_TOKENS,
+                max_new_tokens=max_tokens,
                 do_sample=False,
                 device=device, dtype=dtype,
             )
@@ -714,21 +732,47 @@ def run(job: Job) -> None:
 
             chunk_segments = list(parse_transcript(result["text"]))
             job.log("info",
-                f"Чанк {ci + 1}/{len(chunks)}: "
-                f"{len(chunk_segments)} сегментов")
+                    f"Чанк {ci + 1}/{total_chunks}: "
+                    f"{len(chunk_segments)} сегментов")
 
-            for seg in chunk_segments:
+            # Отдаём сегменты в UI сразу — не дожидаясь конца
+            chunk_index_start = len(all_segments)
+            for j, seg in enumerate(chunk_segments):
+                if job.is_cancelled():
+                    raise InterruptedError()
+
                 text = (seg.text or "").strip()
                 if not text:
                     continue
+
                 speaker = _normalize_speaker(getattr(seg, "speaker", "S01"))
                 speakers_set.add(speaker)
-                all_segments.append({
+
+                seg_data = {
+                    "index": chunk_index_start + j,
                     "start": round(float(seg.start) + offset, 3),
                     "end": round(float(seg.end) + offset, 3),
                     "text": text,
                     "speaker": speaker,
+                }
+                all_segments.append(seg_data)
+
+                # Живое обновление UI через SSE.
+                # В БД НЕ пишем — финальная версия будет сохранена
+                # одним запросом после дедупликации.
+                job.emit({
+                    "type": "segment",
+                    "segment": seg_data,
                 })
+
+            # Обновляем прогресс с учётом готового чанка
+            done_pct = 35 + int(((ci + 1) / total_chunks) * 60)
+            job.set_progress(
+                done_pct,
+                f"Готово чанков: {ci + 1}/{total_chunks}, "
+                f"сегментов: {len(all_segments)}",
+                "transcribing",
+            )
 
             # Освобождаем кэш между чанками
             try:
@@ -747,8 +791,8 @@ def run(job: Job) -> None:
         all_segments = _dedupe_overlap(all_segments)
         if len(all_segments) != before_dedupe:
             job.log("info",
-                f"Удалено дубликатов на границах чанков: "
-                f"{before_dedupe - len(all_segments)}")
+                    f"Удалено дубликатов на границах чанков: "
+                    f"{before_dedupe - len(all_segments)}")
 
         for i, s in enumerate(all_segments):
             s["index"] = i
@@ -815,20 +859,59 @@ def run(job: Job) -> None:
         })
         job.emit({"type": "done", "text": job.text, "metadata": job.metadata})
 
+
     except InterruptedError:
+
         stats["total_seconds"] = round(time.time() - stats["started_at"], 2)
+
         if job._repo:
+
             try:
+
                 job._repo.update_job(
+
                     job.id,
+
                     processing_stats=json.dumps(stats, ensure_ascii=False),
+
                 )
+
             except Exception:
+
                 pass
+
+        # Сохраняем то, что успели распознать
+
+        if all_segments:
+
+            for i, s in enumerate(all_segments):
+                s["index"] = i
+
+            try:
+
+                if job._repo:
+                    job._repo.replace_segments(job.id, all_segments)
+
+                job.segments = all_segments
+
+                job.text = "\n".join(s["text"] for s in all_segments)
+
+                job.log("info",
+
+                        f"Сохранено частичных результатов: {len(all_segments)}")
+
+            except Exception as e:
+
+                job.log("warn", f"Не удалось сохранить частичные результаты: {e}")
+
         job.finished_at = time.time()
+
         job.set_status("cancelled", "Отменено")
+
         job.log("warn", "Транскрибация отменена")
+
         job.persist_final()
+
         job.emit({"type": "cancelled"})
     except Exception as e:
         stats["total_seconds"] = round(time.time() - stats["started_at"], 2)

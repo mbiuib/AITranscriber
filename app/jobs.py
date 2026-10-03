@@ -61,6 +61,7 @@ class Job:
     file_size: int
     model: str
     language: Optional[str]
+    engine: Optional[str] = None
 
     status: str = "pending"
     stage: str = "pending"
@@ -265,6 +266,7 @@ class Job:
             "filename": self.filename,
             "file_path": self.file_path,
             "file_size": self.file_size,
+            "engine": self.engine,
             "model": self.model,
             "language": self.language,
             "status": self.status,
@@ -291,6 +293,7 @@ class Job:
             "id": self.id,
             "filename": self.filename,
             "file_size": self.file_size,
+            "engine": self.engine,
             "model": self.model,
             "status": self.status,
             "progress": self.progress,

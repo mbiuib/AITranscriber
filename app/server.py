@@ -444,6 +444,7 @@ async def _save_and_create_job(
     model: str,
     language: Optional[str],
     check_duplicate: bool,
+    engine: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Сохраняет файл на диск и создаёт задачу.
@@ -484,6 +485,7 @@ async def _save_and_create_job(
         file_size=0,
         model=model,
         language=language,
+        engine=engine,
     )
     job.set_loop(asyncio.get_running_loop())
 
@@ -567,6 +569,7 @@ async def create_job(
     file: UploadFile = File(..., description="Аудио или видеофайл"),
     model: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
+    engine: Optional[str] = Form(None),
     check_duplicate: bool = Form(True),
 ) -> Dict[str, Any]:
     """
@@ -590,7 +593,14 @@ async def create_job(
     model = model or store.get("transcription.model")
     language = None if (language in (None, "auto", "")) else language
 
-    result = await _save_and_create_job(file, model, language, check_duplicate)
+    if engine in (None, ""):
+        engine = None
+    elif engine not in ("whisper", "moss"):
+        engine = None
+
+    result = await _save_and_create_job(
+        file, model, language, check_duplicate, engine,
+    )
 
     if result["status"] == "created":
         return {"job_id": result["job_id"], "status": "queued"}
@@ -617,6 +627,7 @@ async def create_jobs_batch(
     files: List[UploadFile] = File(..., description="Список файлов"),
     model: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
+    engine: Optional[str] = Form(None),
     check_duplicate: bool = Form(True),
 ) -> Dict[str, Any]:
     """
@@ -643,12 +654,19 @@ async def create_jobs_batch(
     model = model or store.get("transcription.model")
     language = None if (language in (None, "auto", "")) else language
 
+    if engine in (None, ""):
+        engine = None
+    elif engine not in ("whisper", "moss"):
+        engine = None
+
     results: List[Dict[str, Any]] = []
     created = duplicates = errors = 0
 
     for idx, f in enumerate(files):
         try:
-            r = await _save_and_create_job(f, model, language, check_duplicate)
+            r = await _save_and_create_job(
+                f, model, language, check_duplicate, engine,
+            )
         except Exception as e:
             r = {
                 "status": "error",

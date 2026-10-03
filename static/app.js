@@ -32,6 +32,7 @@ const state = {
   detailJob: null,
   detailTags: [],
   historyFilter: { q: "", status: "", favorite: false },
+  quickEngine: null,
   files: [],
   dashboardTimer: null,
   selectionMode: false,
@@ -170,8 +171,14 @@ function renderSettingsForm() {
   const form = $("#settings-form");
   form.innerHTML = "";
 
+  const currentEngine =
+    state.settingsDirty["transcription.engine"] ??
+    state.settings["transcription.engine"] ??
+    "whisper";
+
   const groups = {};
   for (const [key, def] of Object.entries(state.schema)) {
+    if (def.engine && def.engine !== currentEngine) continue;
     const g = def.group || "misc";
     if (!groups[g]) groups[g] = [];
     groups[g].push([key, def]);
@@ -246,6 +253,12 @@ function renderField(key, def) {
         if (opt === val) o.selected = true;
         inp.appendChild(o);
       }
+      if (key === "transcription.engine") {
+        inp.addEventListener("change", () => {
+          state.settingsDirty[key] = inp.value;
+          renderSettingsForm();
+        });
+      }
     } else {
       inp = document.createElement("input");
       inp.type = "text";
@@ -272,14 +285,24 @@ function applyQuickOptions() {
   const q = $("#quick-options");
   q.innerHTML = "";
 
-  const modelSel = document.createElement("select");
-  for (const m of state.schema["transcription.model"].options) {
+  // Движок — первым полем
+  const engineSel = document.createElement("select");
+  for (const e of ["whisper", "moss"]) {
     const o = document.createElement("option");
-    o.value = m; o.textContent = m;
-    if (m === state.settings["transcription.model"]) o.selected = true;
-    modelSel.appendChild(o);
+    o.value = e;
+    o.textContent = e === "whisper" ? "Whisper + Pyannote" : "MOSS (end-to-end)";
+    if (e === getQuickEngine()) o.selected = true;
+    engineSel.appendChild(o);
   }
+  engineSel.addEventListener("change", () => {
+    state.quickEngine = engineSel.value;
+    applyQuickOptions();
+  });
+  q.appendChild(wrapField("Движок", engineSel));
 
+  const engine = getQuickEngine();
+
+  // Язык — для обоих движков
   const langSel = document.createElement("select");
   for (const l of state.schema["transcription.language"].options) {
     const o = document.createElement("option");
@@ -288,21 +311,52 @@ function applyQuickOptions() {
     if (l === state.settings["transcription.language"]) o.selected = true;
     langSel.appendChild(o);
   }
+  q.appendChild(wrapField("Язык", langSel));
 
-  const bsInput = createNumberInput(
-    state.settings["transcription.batch_size"],
-    { min: 1, max: 32, step: 1 }
-  );
+  let modelSel = null;
+  let bsInput = null;
 
-  q.appendChild(wrapField(t("field.model"), modelSel));
-  q.appendChild(wrapField(t("field.language"), langSel));
-  q.appendChild(wrapField(t("field.batch_size"), bsInput));
+  if (engine === "whisper") {
+    // Модель
+    modelSel = document.createElement("select");
+    for (const m of state.schema["transcription.model"].options) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      if (m === state.settings["transcription.model"]) o.selected = true;
+      modelSel.appendChild(o);
+    }
+    q.appendChild(wrapField("Модель", modelSel));
+
+    // Batch size
+    bsInput = createNumberInput(
+      state.settings["transcription.batch_size"],
+      { min: 1, max: 32, step: 1 }
+    );
+    q.appendChild(wrapField("Batch size", bsInput));
+  } else {
+    // Для MOSS — подсказка вместо полей
+    const hint = document.createElement("div");
+    hint.className = "quick-hint";
+    hint.innerHTML = `
+      <span class="material-symbols-rounded">info</span>
+      <span>MOSS обрабатывает аудио чанками по 5 минут.
+      Модель и batch size настраиваются автоматически.</span>
+    `;
+    q.appendChild(hint);
+  }
 
   state.quickRefs = {
+    getEngine: () => engine,
     modelSel,
     langSel,
-    getBatchSize: () => bsInput.getValue(),
+    getBatchSize: () => bsInput ? bsInput.getValue() : null,
   };
+}
+
+function getQuickEngine() {
+  if (state.quickEngine) return state.quickEngine;
+  return state.settings["transcription.engine"] || "whisper";
 }
 
 function wrapField(label, input) {
@@ -612,11 +666,14 @@ async function start(forceReprocess = false) {
   $("#cancel-btn").disabled = false;
   ensureConsoleOpen();
 
-  const fd = new FormData();
+    const fd = new FormData();
   for (const f of state.files) {
     fd.append("files", f);
   }
-  fd.append("model", state.quickRefs.modelSel.value);
+  fd.append("engine", state.quickRefs.getEngine());
+  if (state.quickRefs.modelSel) {
+    fd.append("model", state.quickRefs.modelSel.value);
+  }
   fd.append("language", state.quickRefs.langSel.value);
   if (forceReprocess) fd.append("check_duplicate", "false");
 
@@ -750,18 +807,42 @@ function applySnapshot(snap) {
 function onSegmentsReplaced(segments) {
   if (!segments || !segments.length) return;
 
+  const rc = $("#result-content");
+  const wasAtBottom = isNearBottom(rc);
+  const prevSeen = state.seenSegmentsCount;
+
   state.segments = [];
-  state.seenSegmentsCount = 0;
   $("#result-content").innerHTML = '<div class="segments" id="segments"></div>';
 
+  // silent=true — не трогаем seenSegmentsCount и не дёргаем скролл
   for (const s of segments) {
     appendSegment(s, true);
   }
-  state.seenSegmentsCount = state.segments.length;
+
+  if (wasAtBottom) {
+  // Не сбрасываем seenSegmentsCount — если пользователь читает выше,
+  // он должен увидеть кнопку с числом непросмотренных сегментов
+  // даже после завершения задачи
+  if (isNearBottom($("#result-content"))) {
+    state.seenSegmentsCount = state.segments.length;
+  }
+    rc.scrollTop = rc.scrollHeight;
+  } else {
+    // Пользователь читает выше — ограничиваем seen предыдущим
+    // значением, чтобы новые сегменты считались непросмотренными
+    state.seenSegmentsCount = Math.min(prevSeen, state.segments.length);
+  }
+
   updateScrollButton();
 
-  toast("info", "group",
-    `Сегменты разбиты по спикерам: ${segments.length} фрагментов`);
+  const unread = state.segments.length - state.seenSegmentsCount;
+  if (unread > 0) {
+    toast("info", "group",
+      `Сегменты обновлены: ${segments.length}, новых: ${unread}`);
+  } else {
+    toast("info", "group",
+      `Сегменты обновлены: ${segments.length} фрагментов`);
+  }
 }
 
 /* ============================================================
@@ -823,7 +904,7 @@ function updateScrollButton() {
   const btn = $("#scroll-bottom-btn");
   if (!btn) return;
   const unread = state.segments.length - state.seenSegmentsCount;
-  if (unread > 0 && state.running) {
+  if (unread > 0) {
     btn.classList.add("visible");
     $("#scroll-bottom-badge").textContent = unread > 99 ? "99+" : unread;
   } else {
@@ -2072,6 +2153,7 @@ function renderDetailMeta(snap) {
   }
 
   rows.push(["section", "Параметры распознавания"]);
+  rows.push(["Движок", settings.engine || meta.engine || "whisper"]);
   rows.push(["Модель", settings.model || snap.model]);
   rows.push(["Язык (задан)", settings.language || "auto"]);
   rows.push(["Язык (определён)", meta.language || "—"]);

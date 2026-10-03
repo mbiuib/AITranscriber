@@ -33,6 +33,7 @@ const state = {
   detailTags: [],
   historyFilter: { q: "", status: "", favorite: false },
   quickEngine: null,
+  groupBySpeaker: localStorage.getItem("whisper_group_by_speaker") === "1",
   files: [],
   dashboardTimer: null,
   selectionMode: false,
@@ -807,36 +808,32 @@ function applySnapshot(snap) {
 function onSegmentsReplaced(segments) {
   if (!segments || !segments.length) return;
 
+  state.segments = segments.map(s => ({ ...s }));
+  state.seenSegmentsCount = 0;
+
+  // Перерисовываем с учётом режима склейки
   const rc = $("#result-content");
   const wasAtBottom = isNearBottom(rc);
-  const prevSeen = state.seenSegmentsCount;
 
+  rc.innerHTML = '<div class="segments" id="segments"></div>';
+  const backup = state.segments;
   state.segments = [];
-  $("#result-content").innerHTML = '<div class="segments" id="segments"></div>';
-
-  // silent=true — не трогаем seenSegmentsCount и не дёргаем скролл
-  for (const s of segments) {
+  for (const s of backup) {
     appendSegment(s, true);
   }
+  state.segments = backup;
 
   if (wasAtBottom) {
-  // Не сбрасываем seenSegmentsCount — если пользователь читает выше,
-  // он должен увидеть кнопку с числом непросмотренных сегментов
-  // даже после завершения задачи
-  if (isNearBottom($("#result-content"))) {
     state.seenSegmentsCount = state.segments.length;
-  }
     rc.scrollTop = rc.scrollHeight;
   } else {
-    // Пользователь читает выше — ограничиваем seen предыдущим
-    // значением, чтобы новые сегменты считались непросмотренными
-    state.seenSegmentsCount = Math.min(prevSeen, state.segments.length);
+    state.seenSegmentsCount = 0;
   }
 
   updateScrollButton();
 
   const unread = state.segments.length - state.seenSegmentsCount;
-  if (unread > 0) {
+  if (unread > 0 && !wasAtBottom) {
     toast("info", "group",
       `Сегменты обновлены: ${segments.length}, новых: ${unread}`);
   } else {
@@ -923,8 +920,44 @@ function appendSegment(seg, silent = false) {
   const rc = $("#result-content");
   const wasAtBottom = isNearBottom(rc);
 
+  // Режим склейки: если последний сегмент в DOM — того же спикера,
+  // дописываем текст в него, а не создаём новую строку
+  if (state.groupBySpeaker && seg.speaker) {
+    const lastEl = wrap.lastElementChild;
+    if (lastEl && lastEl.classList.contains("segment")) {
+      const lastSpeaker = lastEl.dataset.speaker;
+      if (lastSpeaker && lastSpeaker === seg.speaker) {
+        const textEl = lastEl.querySelector(".text");
+        // Добавляем пробел перед новым текстом
+        textEl.appendChild(document.createTextNode(" " + seg.text));
+        // Обновляем конечное время
+        lastEl.dataset.end = seg.end;
+        lastEl.dataset.merged = "1";
+
+        state.segments.push(seg);
+
+        if (silent) {
+          state.seenSegmentsCount = state.segments.length;
+        } else if (wasAtBottom) {
+          state.seenSegmentsCount = state.segments.length;
+          rc.scrollTop = rc.scrollHeight;
+        }
+        updateScrollButton();
+
+        ["act-copy", "act-txt", "act-srt", "act-json"].forEach(id => {
+          $("#" + id).disabled = false;
+        });
+        return;
+      }
+    }
+  }
+
+  // Обычное добавление
   const line = document.createElement("div");
   line.className = "segment" + (silent ? "" : " new-segment");
+  if (seg.speaker) line.dataset.speaker = seg.speaker;
+  line.dataset.end = seg.end;
+  line.dataset.index = seg.index;
 
   const g = document.createElement("span");
   g.className = "gutter";
@@ -960,6 +993,78 @@ function appendSegment(seg, silent = false) {
   ["act-copy", "act-txt", "act-srt", "act-json"].forEach(id => {
     $("#" + id).disabled = false;
   });
+}
+
+/**
+ * Полностью перерисовывает область результата из state.segments.
+ *
+ * Используется при переключении режима склейки и при получении
+ * события segments_replaced. Всегда идёт от state.segments — этот
+ * массив хранит сырые сегменты, а группировка применяется во время
+ * рендера.
+ */
+function rerenderSegments() {
+  const rc = $("#result-content");
+  if (!state.segments.length) return;
+
+  const wasAtBottom = isNearBottom(rc);
+  const prevSeen = state.seenSegmentsCount;
+
+  rc.innerHTML = '<div class="segments" id="segments"></div>';
+
+  const backup = state.segments;
+  state.segments = [];
+
+  for (const s of backup) {
+    appendSegment(s, true);
+  }
+
+  state.segments = backup;
+
+  // Восстанавливаем seenSegmentsCount с учётом перерисовки
+  if (wasAtBottom) {
+    state.seenSegmentsCount = state.segments.length;
+    rc.scrollTop = rc.scrollHeight;
+  } else {
+    state.seenSegmentsCount = Math.min(prevSeen, state.segments.length);
+  }
+
+  updateScrollButton();
+}
+
+/**
+ * Переключает режим склейки подряд идущих реплик одного спикера.
+ */
+function toggleGroupBySpeaker() {
+  state.groupBySpeaker = !state.groupBySpeaker;
+  try {
+    localStorage.setItem(
+      "whisper_group_by_speaker",
+      state.groupBySpeaker ? "1" : "0",
+    );
+  } catch {}
+
+  updateGroupButtons();
+  rerenderSegments();
+
+  // Если открыта модалка — перерисуем и её
+  if (state.detailJob) {
+    renderDetailTranscript(state.detailJob);
+  }
+
+  toast("info", "join_inner",
+    state.groupBySpeaker
+      ? "Склейка реплик включена"
+      : "Склейка реплик выключена",
+    2000);
+}
+
+/**
+ * Обновляет визуальное состояние кнопок-переключателей.
+ */
+function updateGroupButtons() {
+  $("#act-group-speakers")?.classList.toggle("active", state.groupBySpeaker);
+  $("#d-act-group-speakers")?.classList.toggle("active", state.groupBySpeaker);
 }
 
 function formatTs(sec) {
@@ -1075,6 +1180,7 @@ function resetResult() {
   state.jobId = null;
   state.seenSegmentsCount = 0;
   updateScrollButton();
+  updateGroupButtons();
 
   $("#result-stats").hidden = true;
   $("#result-content").innerHTML = `
@@ -1918,17 +2024,7 @@ function renderDetail(snap) {
   const star = $("#detail-star");
   star.classList.toggle("starred", !!snap.starred);
 
-  const tr = $("#detail-transcript");
-  if (snap.segments && snap.segments.length) {
-    tr.innerHTML = "";
-    for (const s of snap.segments) {
-      tr.appendChild(buildSegmentRow(s));
-    }
-  } else if (snap.text) {
-    tr.textContent = snap.text;
-  } else {
-    tr.innerHTML = `<div class="empty-state"><div class="empty-icon material-symbols-rounded">hourglass_empty</div><div class="empty-text">Результат ещё не готов</div></div>`;
-  }
+  renderDetailTranscript(snap);
 
   renderDetailMeta(snap);
   renderDetailStats(snap);
@@ -1937,15 +2033,66 @@ function renderDetail(snap) {
 }
 
 /**
- * Создаёт DOM-строку одного сегмента с обработчиком редактирования.
- * Клик по тексту запускает inline-редактор (textarea).
+ * Рендерит транскрипт в модалке с учётом режима склейки.
  *
- * @param {object} seg Объект сегмента {index, start, end, text}.
+ * @param {object} snap Снимок задачи.
+ */
+function renderDetailTranscript(snap) {
+  const tr = $("#detail-transcript");
+
+  if (!snap.segments || !snap.segments.length) {
+    if (snap.text) {
+      tr.textContent = snap.text;
+    } else {
+      tr.innerHTML = `<div class="empty-state">
+        <div class="empty-icon material-symbols-rounded">hourglass_empty</div>
+        <div class="empty-text">Результат ещё не готов</div>
+      </div>`;
+    }
+    return;
+  }
+
+  tr.innerHTML = "";
+  const mapping = snap.metadata?.speaker_names || {};
+
+  let currentRow = null;
+  let currentSpeaker = null;
+
+  for (const s of snap.segments) {
+    // Режим склейки: если тот же спикер — дописываем в текущую строку
+    if (state.groupBySpeaker && s.speaker && currentRow && currentSpeaker === s.speaker) {
+      const textEl = currentRow.querySelector(".text");
+      textEl.appendChild(document.createTextNode(" " + s.text));
+      currentRow.dataset.end = s.end;
+      currentRow.dataset.merged = "1";
+      continue;
+    }
+
+    const row = buildSegmentRow(s, mapping);
+    if (s.speaker) {
+      currentSpeaker = s.speaker;
+      currentRow = row;
+    } else {
+      currentSpeaker = null;
+      currentRow = null;
+    }
+    tr.appendChild(row);
+  }
+}
+
+/**
+ * Создаёт DOM-строку одного сегмента с обработчиком редактирования.
+ *
+ * @param {object} seg Объект сегмента {index, start, end, text, speaker}.
+ * @param {object} [mapping] Словарь переопределений имён спикеров.
  * @returns {HTMLElement} Готовая строка.
  */
-function buildSegmentRow(seg) {
+function buildSegmentRow(seg, mapping) {
   const line = document.createElement("div");
   line.className = "segment";
+  if (seg.speaker) line.dataset.speaker = seg.speaker;
+  line.dataset.end = seg.end;
+  line.dataset.index = seg.index;
 
   const g = document.createElement("span");
   g.className = "gutter";
@@ -1955,7 +2102,6 @@ function buildSegmentRow(seg) {
   tx.className = "text";
 
   if (seg.speaker) {
-    const mapping = state.detailJob?.metadata?.speaker_names || {};
     const name = speakerName(seg.speaker, mapping);
     const chip = document.createElement("span");
     chip.className = "speaker";
@@ -1964,14 +2110,20 @@ function buildSegmentRow(seg) {
     tx.appendChild(chip);
   }
 
-  const textNode = document.createTextNode(seg.text);
-  tx.appendChild(textNode);
-
+  tx.appendChild(document.createTextNode(seg.text));
   line.append(g, tx);
 
+  // Обработчик — ПОСЛЕ создания line
   line.addEventListener("click", (e) => {
     if (line.querySelector("textarea.segment-edit")) return;
     if (e.target.tagName === "TEXTAREA") return;
+
+    if (state.groupBySpeaker && line.dataset.merged === "1") {
+      toast("warn", "info",
+        "Отключите склейку реплик, чтобы редактировать отдельные сегменты",
+        3000);
+      return;
+    }
     startSegmentEdit(line, seg);
   });
 
@@ -2048,7 +2200,8 @@ function renderDetailSpeakers(snap) {
  *
  * Enter — сохранить, Shift+Enter — перенос строки, Esc — отменить,
  * blur — сохранить. Высота textarea автоматически подстраивается под
- * содержимое: при открытии и после каждого ввода.
+ * содержимое. При закрытии редактора восстанавливается исходная
+ * структура строки: gutter, chip спикера (если есть), span с текстом.
  *
  * @param {HTMLElement} line Строка сегмента.
  * @param {object} seg Объект сегмента.
@@ -2056,6 +2209,12 @@ function renderDetailSpeakers(snap) {
 function startSegmentEdit(line, seg) {
   const textEl = line.querySelector(".text");
   const original = seg.text;
+  const speaker = seg.speaker;
+
+  // Запоминаем chip спикера, чтобы вернуть его после редактирования.
+  // Клонируем — на случай, если что-то пойдёт не так с исходным узлом.
+  const speakerChip = textEl.querySelector(".speaker");
+  const chipClone = speakerChip ? speakerChip.cloneNode(true) : null;
 
   const ta = document.createElement("textarea");
   ta.className = "segment-edit";
@@ -2079,6 +2238,7 @@ function startSegmentEdit(line, seg) {
 
   const finish = async (save) => {
     const newText = ta.value.trim();
+    let didChange = false;
 
     if (save && newText && newText !== original) {
       try {
@@ -2092,18 +2252,47 @@ function startSegmentEdit(line, seg) {
         );
         if (!r.ok) throw new Error((await r.json()).detail || "Ошибка сохранения");
         const d = await r.json();
+
+        // Обновляем объект сегмента в state.detailJob
         seg.text = newText;
         state.detailJob.text = d.text;
+        didChange = true;
+
+        // Синхронизируем с state.segments главного окна, если там тот же сегмент
+        // (у активной задачи ID сегмента совпадает по index)
+        if (state.jobId === state.detailJob.id) {
+          const mainSeg = state.segments.find(x => x.index === seg.index);
+          if (mainSeg) mainSeg.text = newText;
+        }
+
         toast("success", "check_circle", "Сегмент обновлён");
       } catch (e) {
         toast("error", "error", e.message);
       }
     }
 
+    // Восстанавливаем структуру строки: chip + текст
     const span = document.createElement("span");
     span.className = "text";
-    span.textContent = seg.text;
+
+    if (chipClone) {
+      span.appendChild(chipClone.cloneNode(true));
+    } else if (speaker) {
+      // Если chip почему-то потерялся — воссоздаём по данным сегмента
+      const chip = document.createElement("span");
+      chip.className = "speaker";
+      chip.textContent = speakerName(speaker, null);
+      chip.style.setProperty("--speaker-color", speakerColor(speaker));
+      span.appendChild(chip);
+    }
+
+    span.appendChild(document.createTextNode(seg.text));
     ta.replaceWith(span);
+
+    // Если текст изменился — обновим и главное окно
+    if (didChange && state.jobId === state.detailJob.id) {
+      rerenderSegments();
+    }
   };
 
   ta.addEventListener("keydown", (e) => {
@@ -2324,6 +2513,7 @@ function setupDetailModal() {
     }
   });
 
+  $("#d-act-group-speakers").addEventListener("click", toggleGroupBySpeaker);
   $("#detail-save-notes").addEventListener("click", saveDetailNotes);
 
   $("#detail-star").addEventListener("click", async () => {
@@ -2567,6 +2757,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     b.addEventListener("click", () => setTheme(b.dataset.themeSet))
   );
 
+  updateGroupButtons();
   setupNav();
   setupSidebar();
   setupDropzone();
@@ -2580,6 +2771,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#start-btn").addEventListener("click", () => start(false));
   $("#cancel-btn").addEventListener("click", cancelJob);
   $("#act-copy").addEventListener("click", copyText);
+  $("#act-group-speakers").addEventListener("click", toggleGroupBySpeaker);
   $("#act-txt").addEventListener("click", downloadTxt);
   $("#act-srt").addEventListener("click", downloadSrt);
   $("#act-json").addEventListener("click", downloadJson);

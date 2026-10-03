@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,140 +8,229 @@
 </head>
 <body>
 
-<header class="topbar">
-  <div class="brand">
-    <span class="logo">🎙️</span>
-    <span class="title">Whisper Transcriber</span>
-    <span class="badge">web</span>
-  </div>
-  <div class="gpu-info" id="gpu-info">
-    <span class="dot"></span>
-    <span class="text">Проверка GPU…</span>
-  </div>
-</header>
+<div class="app">
 
-<main class="container">
-
-  <!-- ==================== Панель загрузки ==================== -->
-  <section class="panel upload-panel">
-    <div class="panel-header">
-      <h2>Новая транскрибация</h2>
-    </div>
-
-    <div class="dropzone" id="dropzone">
-      <input type="file" id="file-input" accept="audio/*,video/*,.m4a,.mkv,.webm" hidden>
-      <div class="dropzone-inner">
-        <div class="dropzone-icon">📁</div>
-        <div class="dropzone-title">Перетащите файл сюда</div>
-        <div class="dropzone-hint">или нажмите для выбора · MP4 · MKV · M4A · MP3 · WAV</div>
+  <!-- ============ Sidebar ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-logo">🎙️</span>
+      <div class="brand-text">
+        <div class="brand-title">Whisper</div>
+        <div class="brand-sub">Transcriber</div>
       </div>
     </div>
 
-    <div class="file-chip" id="file-chip" hidden>
-      <span class="chip-icon">📎</span>
-      <span class="chip-name" id="chip-name"></span>
-      <span class="chip-size" id="chip-size"></span>
-      <button class="chip-remove" id="chip-remove" title="Убрать файл">×</button>
-    </div>
-
-    <div class="options-grid">
-      <label class="field">
-        <span class="field-label">Модель</span>
-        <select id="opt-model"></select>
-      </label>
-      <label class="field">
-        <span class="field-label">Язык</span>
-        <select id="opt-language"></select>
-      </label>
-      <label class="field">
-        <span class="field-label">Batch size</span>
-        <input type="number" id="opt-batch" min="1" max="32" value="8">
-      </label>
-      <label class="field field-checkbox">
-        <input type="checkbox" id="opt-vad" checked>
-        <span>VAD-фильтрация</span>
-      </label>
-    </div>
-
-    <details class="advanced">
-      <summary>Дополнительные параметры</summary>
-      <div class="advanced-grid">
-        <label class="field">
-          <span class="field-label">Начальный промпт</span>
-          <input type="text" id="opt-prompt" placeholder="Например: «Совещание на русском, техническая терминология»">
-        </label>
-        <label class="field">
-          <span class="field-label">Слова-подсказки</span>
-          <input type="text" id="opt-hotwords" placeholder="Иван Петров, Kubernetes, REST API">
-        </label>
-      </div>
-    </details>
-
-    <div class="actions">
-      <button id="start-btn" class="btn btn-primary" disabled>
-        <span class="icon">▶</span> Начать транскрибацию
+    <nav class="nav">
+      <button class="nav-item active" data-view="new">
+        <span class="nav-icon">✨</span>
+        <span data-i18n="nav.new">Новая задача</span>
       </button>
-      <button id="cancel-btn" class="btn btn-danger" disabled>
-        <span class="icon">⏹</span> Отмена
+      <button class="nav-item" data-view="history">
+        <span class="nav-icon">📚</span>
+        <span data-i18n="nav.history">История</span>
+        <span class="nav-badge" id="nav-badge-history" hidden>0</span>
       </button>
-    </div>
+      <button class="nav-item" data-view="system">
+        <span class="nav-icon">📊</span>
+        <span data-i18n="nav.system">Система</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <span class="nav-icon">⚙️</span>
+        <span data-i18n="nav.settings">Настройки</span>
+      </button>
+    </nav>
 
-    <div class="progress-wrap" id="progress-wrap">
-      <div class="progress-bar">
-        <div class="progress-fill" id="progress-fill"></div>
+    <div class="sidebar-footer">
+      <div class="theme-switch">
+        <button data-theme-set="dark" title="Dark">🌙</button>
+        <button data-theme-set="light" title="Light">☀️</button>
       </div>
-      <div class="progress-meta">
-        <span class="progress-stage" id="progress-stage">Ожидание</span>
-        <span class="progress-pct" id="progress-pct">0%</span>
-      </div>
-      <div class="progress-message" id="progress-message"></div>
-    </div>
-  </section>
-
-  <!-- ==================== Панель результата ==================== -->
-  <section class="panel result-panel">
-    <div class="panel-header">
-      <h2>Результат</h2>
-      <div class="panel-actions">
-        <button class="btn btn-ghost" id="act-copy" disabled title="Копировать текст">
-          📋 Копировать
-        </button>
-        <button class="btn btn-ghost" id="act-txt" disabled>💾 .txt</button>
-        <button class="btn btn-ghost" id="act-srt" disabled>💾 .srt</button>
-        <button class="btn btn-ghost" id="act-json" disabled>💾 .json</button>
+      <div class="lang-switch" id="lang-switch"></div>
+      <div class="status-pill" id="server-status">
+        <span class="dot"></span>
+        <span class="label" data-i18n="status.connected">Сервер доступен</span>
       </div>
     </div>
+  </aside>
 
-    <div class="result-content" id="result-content">
-      <div class="empty-state">
-        <div class="empty-icon">✨</div>
-        <div class="empty-text">Здесь появится распознанный текст</div>
-        <div class="empty-hint">Загрузите файл и нажмите «Начать транскрибацию»</div>
+  <!-- ============ Main ============ -->
+  <main class="main">
+
+    <!-- ---- View: New ---- -->
+    <section class="view active" data-view="new">
+      <header class="view-header">
+        <h1 data-i18n="upload.title">Новая транскрибация</h1>
+        <div class="header-actions">
+          <div class="gpu-pill" id="gpu-pill">
+            <span class="dot"></span>
+            <span class="text">…</span>
+          </div>
+        </div>
+      </header>
+
+      <div class="view-body">
+        <div class="layout-2col">
+
+          <!-- Left: upload + controls -->
+          <div class="col-left">
+            <div class="card">
+              <div class="dropzone" id="dropzone">
+                <input type="file" id="file-input" hidden
+                       accept="audio/*,video/*,.m4a,.mkv,.webm,.mp4,.mp3,.wav,.flac">
+                <div class="dropzone-inner">
+                  <div class="dropzone-icon">📁</div>
+                  <div class="dropzone-title" data-i18n="upload.drop">Перетащите файл сюда</div>
+                  <div class="dropzone-hint" data-i18n="upload.hint">или нажмите для выбора</div>
+                  <div class="dropzone-formats" data-i18n="upload.formats">MP4 · MKV · M4A · MP3 · WAV</div>
+                </div>
+              </div>
+
+              <div class="file-chip" id="file-chip" hidden>
+                <span class="chip-icon">📎</span>
+                <span class="chip-name" id="chip-name"></span>
+                <span class="chip-size" id="chip-size"></span>
+                <button class="chip-remove" id="chip-remove" title="Убрать">×</button>
+              </div>
+
+              <div class="quick-options" id="quick-options"></div>
+
+              <div class="actions">
+                <button id="start-btn" class="btn btn-primary btn-lg" disabled>
+                  <span class="icon">▶</span>
+                  <span data-i18n="action.start">Начать транскрибацию</span>
+                </button>
+                <button id="cancel-btn" class="btn btn-danger" disabled>
+                  <span class="icon">⏹</span>
+                  <span data-i18n="action.cancel">Отмена</span>
+                </button>
+              </div>
+
+              <div class="progress-block" id="progress-block">
+                <div class="progress-header">
+                  <span class="stage" id="progress-stage" data-i18n="stage.pending">Ожидание</span>
+                  <span class="pct" id="progress-pct">0%</span>
+                </div>
+                <div class="progress-bar">
+                  <div class="progress-fill" id="progress-fill"></div>
+                </div>
+                <div class="progress-msg" id="progress-msg"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: result -->
+          <div class="col-right">
+            <div class="card result-card">
+              <div class="card-header">
+                <h2 data-i18n="result.title">Результат</h2>
+                <div class="header-actions">
+                  <button class="btn-icon" id="act-copy" disabled title="Копировать">📋</button>
+                  <button class="btn-icon" id="act-txt" disabled title=".txt">💾</button>
+                  <button class="btn-icon" id="act-srt" disabled title=".srt">🎬</button>
+                  <button class="btn-icon" id="act-json" disabled title=".json">{ }</button>
+                </div>
+              </div>
+              <div class="result-stats" id="result-stats" hidden></div>
+              <div class="result-content" id="result-content">
+                <div class="empty-state">
+                  <div class="empty-icon">✨</div>
+                  <div class="empty-text" data-i18n="result.empty">Здесь появится распознанный текст</div>
+                  <div class="empty-hint" data-i18n="result.empty_hint">Загрузите файл и начните</div>
+                </div>
+              </div>
+              <button class="scroll-bottom-btn" id="scroll-bottom-btn">
+                <span class="arrow">↓</span>
+                <span class="label" data-i18n="result.new_segments">Новые сегменты</span>
+                <span class="badge" id="scroll-bottom-badge">0</span>
+              </button>
+            </div>
+          </div>
+
+        </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-</main>
+    <!-- ---- View: History ---- -->
+    <section class="view" data-view="history">
+      <header class="view-header">
+        <h1 data-i18n="history.title">История задач</h1>
+        <div class="header-actions">
+          <span class="muted" id="retention-info"></span>
+          <button class="btn btn-ghost" id="history-refresh">
+            <span>⟳</span>
+            <span data-i18n="action.refresh">Обновить</span>
+          </button>
+        </div>
+      </header>
+      <div class="view-body">
+        <div class="card">
+          <div id="history-list" class="history-list">
+            <div class="empty-state">
+              <div class="empty-icon">📚</div>
+              <div class="empty-text" data-i18n="history.empty">История пуста</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
 
-<!-- ==================== Консоль ==================== -->
+    <!-- ---- View: System ---- -->
+    <section class="view" data-view="system">
+      <header class="view-header">
+        <h1 data-i18n="system.title">Системные ресурсы</h1>
+        <div class="header-actions">
+          <span class="pulse" id="monitor-pulse"></span>
+        </div>
+      </header>
+      <div class="view-body">
+        <div class="metrics-grid" id="metrics-grid"></div>
+        <div class="card" id="disks-card">
+          <div class="card-header"><h2 data-i18n="system.disks">Диски</h2></div>
+          <div id="disks-list" class="disks-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---- View: Settings ---- -->
+    <section class="view" data-view="settings">
+      <header class="view-header">
+        <h1 data-i18n="settings.title">Настройки</h1>
+        <div class="header-actions">
+          <button class="btn btn-ghost" id="settings-reset">
+            <span data-i18n="action.reset">Сбросить</span>
+          </button>
+          <button class="btn btn-primary" id="settings-save">
+            <span data-i18n="action.save">Сохранить</span>
+          </button>
+        </div>
+      </header>
+      <div class="view-body">
+        <div id="settings-form" class="settings-form"></div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ============ Console ============ -->
 <div class="console" id="console">
   <div class="console-header" id="console-toggle">
     <div class="console-title">
       <span class="console-chevron" id="console-chevron">▼</span>
-      <span>Консоль</span>
+      <span data-i18n="console.title">Консоль</span>
       <span class="console-counter" id="console-counter">0</span>
     </div>
     <div class="console-actions">
-      <button class="btn btn-mini" id="console-clear">Очистить</button>
-      <button class="btn btn-mini" id="console-copy">Копировать</button>
+      <button class="btn-mini" id="console-clear" data-i18n="action.clear">Очистить</button>
+      <button class="btn-mini" id="console-copy" data-i18n="action.copy">Копировать</button>
     </div>
   </div>
   <div class="console-body" id="console-body">
-    <div class="console-empty">Логи появятся здесь…</div>
+    <div class="console-empty" data-i18n="console.empty">Логи появятся здесь…</div>
   </div>
 </div>
 
-<!-- ==================== Тосты ==================== -->
+<!-- ============ Toasts ============ -->
 <div class="toasts" id="toasts"></div>
 
 <script src="/app.js"></script>

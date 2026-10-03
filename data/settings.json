@@ -1,0 +1,8 @@
+{
+  "ui.theme": "dark",
+  "ui.language": "ru",
+  "transcription.device": "cuda",
+  "transcription.compute_type": "float16",
+  "transcription.batch_size": 10,
+  "transcription.language": "auto"
+}

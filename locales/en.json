@@ -49,6 +49,7 @@
   "stage.done": "Done",
   "stage.error": "Error",
   "stage.cancelled": "Cancelled",
+  "stage.interrupted": "Interrupted",
 
   "result.title": "Result",
   "result.empty": "Transcribed text will appear here",

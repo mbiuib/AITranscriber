@@ -29,6 +29,8 @@ const state = {
   jobs: [],
   monitorTimer: null,
   seenSegmentsCount: 0,
+  detailJob: null,
+  detailTags: [],
 };
 
 /* ============================================================
@@ -915,8 +917,15 @@ function renderHistory() {
   for (const j of state.jobs) {
     const item = document.createElement("div");
     item.className = "history-item";
+    item.style.cursor = "pointer";
+
     const created = new Date(j.created_at * 1000).toLocaleString("ru-RU");
     const dur = j.duration ? formatTs(j.duration) : "—";
+    const tagsHtml = (j.tags || []).length
+      ? `<div class="history-tags">${j.tags.map(tag =>
+          `<span class="history-tag">${escapeHtml(tag)}</span>`).join("")}</div>`
+      : "";
+
     item.innerHTML = `
       <div class="history-icon">
         <span class="material-symbols-rounded">movie</span>
@@ -924,6 +933,7 @@ function renderHistory() {
       <div class="history-main">
         <div class="history-name"></div>
         <div class="history-meta">${created} · ${j.model} · ${dur} · ${j.segments_count} сегм.</div>
+        ${tagsHtml}
       </div>
       <div class="history-status ${j.status}">${t("stage." + j.status) || j.status}</div>
       <button class="btn-icon" data-action="delete" title="Удалить">
@@ -931,6 +941,12 @@ function renderHistory() {
       </button>
     `;
     item.querySelector(".history-name").textContent = j.filename;
+
+    item.addEventListener("click", (e) => {
+      if (e.target.closest('[data-action="delete"]')) return;
+      openJobDetail(j.id);
+    });
+
     item.querySelector('[data-action="delete"]').addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!confirm(t("history.delete_confirm"))) return;
@@ -1083,6 +1099,327 @@ function ensureConsoleOpen() {
 }
 
 /* ============================================================
+   Job detail modal
+   ============================================================ */
+async function openJobDetail(jobId) {
+  try {
+    const r = await fetch(`/api/jobs/${jobId}`);
+    if (!r.ok) throw new Error("Задача не найдена");
+    const snap = await r.json();
+
+    state.detailJob = snap;
+    state.detailTags = [...(snap.tags || [])];
+
+    renderDetail(snap);
+    $("#detail-modal").classList.add("visible");
+    document.body.style.overflow = "hidden";
+
+    // Активируем вкладку «Транскрипт» по умолчанию
+    $$(".modal-tab").forEach(t =>
+      t.classList.toggle("active", t.dataset.dtab === "transcript")
+    );
+    $$(".modal-pane").forEach(p =>
+      p.classList.toggle("active", p.dataset.dpane === "transcript")
+    );
+  } catch (e) {
+    toast("error", "error", e.message);
+  }
+}
+
+function closeJobDetail() {
+  $("#detail-modal").classList.remove("visible");
+  document.body.style.overflow = "";
+  state.detailJob = null;
+  state.detailTags = [];
+}
+
+function renderDetail(snap) {
+  $("#detail-filename").textContent = snap.filename;
+  $("#detail-filename").title = snap.filename;
+
+  // Транскрипт
+  const tr = $("#detail-transcript");
+  if (snap.segments && snap.segments.length) {
+    tr.innerHTML = "";
+    for (const s of snap.segments) {
+      const line = document.createElement("div");
+      line.className = "segment";
+      const g = document.createElement("span");
+      g.className = "gutter";
+      g.textContent = formatTs(s.start);
+      const tx = document.createElement("span");
+      tx.className = "text";
+      tx.textContent = s.text;
+      line.append(g, tx);
+      tr.appendChild(line);
+    }
+  } else if (snap.text) {
+    tr.textContent = snap.text;
+  } else {
+    tr.innerHTML = `<div class="empty-state"><div class="empty-icon material-symbols-rounded">hourglass_empty</div><div class="empty-text">Результат ещё не готов</div></div>`;
+  }
+
+  // Метаданные
+  renderDetailMeta(snap);
+
+  // Статистика
+  renderDetailStats(snap);
+
+  // Теги и заметки
+  renderDetailNotes(snap);
+}
+
+function renderDetailMeta(snap) {
+  const el = $("#detail-meta");
+  const src = snap.source_metadata || {};
+  const settings = snap.settings_snapshot || {};
+  const meta = snap.metadata || {};
+
+  const rows = [];
+
+  rows.push(["section", "Файл"]);
+  rows.push(["Имя", snap.filename]);
+  rows.push(["Размер", snap.file_size ? formatSize(snap.file_size) : "—"]);
+  if (src.format_name) rows.push(["Формат", src.format_name]);
+  if (src.duration) rows.push(["Длительность", formatTs(src.duration)]);
+  if (src.bitrate_kbps) rows.push(["Битрейт", `${src.bitrate_kbps} kbps`]);
+  if (snap.file_hash) rows.push(["SHA-256", snap.file_hash.slice(0, 16) + "…"]);
+
+  if (src.audio) {
+    rows.push(["section", "Аудио"]);
+    if (src.audio.codec) rows.push(["Кодек", src.audio.codec.toUpperCase()]);
+    if (src.audio.sample_rate) rows.push(["Частота", `${src.audio.sample_rate} Hz`]);
+    if (src.audio.channels) rows.push(["Каналов", src.audio.channels]);
+  }
+
+  if (src.video) {
+    rows.push(["section", "Видео"]);
+    if (src.video.codec) rows.push(["Кодек", src.video.codec.toUpperCase()]);
+    if (src.video.width && src.video.height) {
+      rows.push(["Разрешение", `${src.video.width}×${src.video.height}`]);
+    }
+    if (src.video.fps) rows.push(["FPS", src.video.fps]);
+  }
+
+  rows.push(["section", "Параметры распознавания"]);
+  rows.push(["Модель", settings.model || snap.model]);
+  rows.push(["Язык (задан)", settings.language || "auto"]);
+  rows.push(["Язык (определён)", meta.language || "—"]);
+  if (meta.language_probability) {
+    rows.push(["Уверенность", `${(meta.language_probability * 100).toFixed(0)}%`]);
+  }
+  rows.push(["VAD", settings.vad ? "включён" : "выключен"]);
+  rows.push(["Batch size", settings.batch_size || "—"]);
+  rows.push(["Beam size", settings.beam_size || "—"]);
+  rows.push(["Устройство", settings.device || "—"]);
+  rows.push(["Точность", settings.compute_type || "—"]);
+
+  rows.push(["section", "Даты"]);
+  rows.push(["Создана", new Date(snap.created_at * 1000).toLocaleString("ru-RU")]);
+  if (snap.finished_at) {
+    rows.push(["Завершена", new Date(snap.finished_at * 1000).toLocaleString("ru-RU")]);
+  }
+
+  let html = "";
+  let inGrid = false;
+  for (const row of rows) {
+    if (row[0] === "section") {
+      if (inGrid) { html += "</dl>"; inGrid = false; }
+      html += `<div class="detail-section"><h3>${row[1]}</h3>`;
+    } else {
+      if (!inGrid) { html += '<dl class="detail-grid">'; inGrid = true; }
+      const val = row[1] === undefined || row[1] === null || row[1] === ""
+        ? '<span class="empty">—</span>' : escapeHtml(String(row[1]));
+      html += `<dt>${escapeHtml(row[0])}</dt><dd>${val}</dd>`;
+    }
+  }
+  if (inGrid) html += "</dl>";
+  el.innerHTML = html;
+}
+
+function renderDetailStats(snap) {
+  const el = $("#detail-stats");
+  const stats = snap.processing_stats || {};
+  const meta = snap.metadata || {};
+
+  if (!Object.keys(stats).length && !Object.keys(meta).length) {
+    el.innerHTML = `<div class="empty-state"><div class="empty-icon material-symbols-rounded">analytics</div><div class="empty-text">Статистика пока недоступна</div></div>`;
+    return;
+  }
+
+  const rows = [];
+
+  if (stats.stages) {
+    rows.push(["section", "Время по этапам"]);
+    const labels = {
+      extract_audio: "Извлечение аудио",
+      download_model: "Скачивание модели",
+      load_model: "Загрузка в GPU",
+      transcribe: "Транскрибация",
+    };
+    for (const [key, label] of Object.entries(labels)) {
+      if (stats.stages[key]) rows.push([label, `${stats.stages[key]} с`]);
+    }
+    if (stats.total_seconds) rows.push(["Всего", `${stats.total_seconds} с`]);
+  }
+
+  rows.push(["section", "Показатели"]);
+  if (meta.duration) rows.push(["Длительность аудио", formatTs(meta.duration)]);
+  if (meta.processing_time) rows.push(["Время обработки", `${meta.processing_time.toFixed(1)} с`]);
+  if (meta.speed_factor) rows.push(["Скорость", `×${meta.speed_factor}`]);
+  if (stats.rtf) rows.push(["RTF", stats.rtf]);
+  if (stats.peak_vram_mb) rows.push(["Пик VRAM", `${stats.peak_vram_mb} МБ`]);
+  if (meta.segments_count) rows.push(["Сегментов", meta.segments_count]);
+  if (snap.text) rows.push(["Символов", snap.text.length.toLocaleString()]);
+
+  let html = "";
+  let inGrid = false;
+  for (const row of rows) {
+    if (row[0] === "section") {
+      if (inGrid) { html += "</dl>"; inGrid = false; }
+      html += `<div class="detail-section"><h3>${row[1]}</h3>`;
+    } else {
+      if (!inGrid) { html += '<dl class="detail-grid">'; inGrid = true; }
+      html += `<dt>${escapeHtml(row[0])}</dt><dd>${escapeHtml(String(row[1]))}</dd>`;
+    }
+  }
+  if (inGrid) html += "</dl>";
+  el.innerHTML = html;
+}
+
+function renderDetailNotes(snap) {
+  state.detailTags = [...(snap.tags || [])];
+  $("#detail-notes").value = snap.notes || "";
+  renderTags();
+}
+
+function renderTags() {
+  const wrap = $("#detail-tags");
+  const input = $("#detail-tag-input");
+  wrap.querySelectorAll(".tag-chip").forEach(c => c.remove());
+
+  for (const tag of state.detailTags) {
+    const chip = document.createElement("span");
+    chip.className = "tag-chip";
+    chip.innerHTML = `${escapeHtml(tag)}<span class="material-symbols-rounded" data-remove="${escapeHtml(tag)}">close</span>`;
+    wrap.insertBefore(chip, input);
+  }
+
+  wrap.querySelectorAll("[data-remove]").forEach(el => {
+    el.addEventListener("click", () => {
+      const tag = el.dataset.remove;
+      state.detailTags = state.detailTags.filter(t => t !== tag);
+      renderTags();
+    });
+  });
+}
+
+function escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+async function saveDetailNotes() {
+  if (!state.detailJob) return;
+  try {
+    const r = await fetch(`/api/jobs/${state.detailJob.id}/notes`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tags: state.detailTags,
+        notes: $("#detail-notes").value,
+      }),
+    });
+    if (!r.ok) throw new Error("Ошибка сохранения");
+    toast("success", "check_circle", "Заметки сохранены");
+    refreshHistory();
+  } catch (e) {
+    toast("error", "error", e.message);
+  }
+}
+
+function setupDetailModal() {
+  $("#detail-close").addEventListener("click", closeJobDetail);
+  $("#detail-modal").addEventListener("click", (e) => {
+    if (e.target.id === "detail-modal") closeJobDetail();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && $("#detail-modal").classList.contains("visible")) {
+      closeJobDetail();
+    }
+  });
+
+  $$(".modal-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      const target = tab.dataset.dtab;
+      $$(".modal-tab").forEach(t => t.classList.toggle("active", t === tab));
+      $$(".modal-pane").forEach(p =>
+        p.classList.toggle("active", p.dataset.dpane === target)
+      );
+    });
+  });
+
+  // Ввод тега
+  $("#detail-tag-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.value.trim()) {
+      e.preventDefault();
+      const tag = e.target.value.trim().slice(0, 32).toLowerCase();
+      if (!state.detailTags.includes(tag) && state.detailTags.length < 16) {
+        state.detailTags.push(tag);
+        renderTags();
+      }
+      e.target.value = "";
+    }
+  });
+
+  $("#detail-save-notes").addEventListener("click", saveDetailNotes);
+
+  // Экспорт из модалки
+  $("#d-act-copy").addEventListener("click", () => {
+    const snap = state.detailJob;
+    if (!snap || !snap.segments) return;
+    const txt = snap.segments.map(s => s.text).join("\n");
+    navigator.clipboard.writeText(txt);
+    toast("success", "content_copy", t("toast.copied"));
+  });
+
+  $("#d-act-txt").addEventListener("click", () => {
+    const snap = state.detailJob;
+    if (!snap) return;
+    const txt = (snap.segments || []).map(s => s.text).join("\n\n");
+    downloadBlob(txt, snap.filename.replace(/\.[^.]+$/, "") + ".txt", "text/plain");
+  });
+
+  $("#d-act-srt").addEventListener("click", () => {
+    const snap = state.detailJob;
+    if (!snap || !snap.segments) return;
+    const srt = snap.segments.map((s, i) =>
+      `${i+1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.end)}\n${s.text}\n`
+    ).join("\n");
+    downloadBlob(srt, snap.filename.replace(/\.[^.]+$/, "") + ".srt", "application/x-subrip");
+  });
+
+  $("#d-act-json").addEventListener("click", () => {
+    const snap = state.detailJob;
+    if (!snap) return;
+    downloadBlob(
+      JSON.stringify({
+        text: snap.text,
+        segments: snap.segments,
+        metadata: snap.metadata,
+        source_metadata: snap.source_metadata,
+        processing_stats: snap.processing_stats,
+        tags: snap.tags,
+        notes: snap.notes,
+      }, null, 2),
+      snap.filename.replace(/\.[^.]+$/, "") + ".json",
+      "application/json"
+    );
+  });
+}
+
+/* ============================================================
    Navigation
    ============================================================ */
 function setupNav() {
@@ -1168,6 +1505,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupSidebar();
   setupDropzone();
   setupConsole();
+  setupDetailModal();
   setupResultScroll();
   await loadSystem();
 

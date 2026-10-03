@@ -49,6 +49,7 @@
   "stage.done": "Готово",
   "stage.error": "Ошибка",
   "stage.cancelled": "Отменено",
+  "stage.interrupted": "Прервано",
 
   "result.title": "Результат",
   "result.empty": "Здесь появится распознанный текст",

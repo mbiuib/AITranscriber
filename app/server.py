@@ -28,7 +28,8 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .config import RUNTIME_SCHEMA, get_env, get_store
 from .i18n import available as locales_available, load as load_locale
-from .jobs import job_manager
+from .config import get_repository
+from .jobs import init_job_manager, get_job_manager
 from . import monitor, transcribe
 
 BASE_DIR = Path(__file__).parent.parent
@@ -121,29 +122,14 @@ STARTED_AT = time.time()
 
 
 def _cleanup_loop() -> None:
-    """
-    Фоновый цикл автоочистки завершённых задач и осиротевших файлов.
-
-    Запускается в отдельном daemon-потоке при старте приложения. Период
-    между итерациями берётся из настройки server.cleanup_interval_min
-    и перечитывается на каждом цикле — то есть изменение в UI вступает
-    в силу без перезапуска сервера.
-
-    Осиротевшие файлы удаляются с двойным запасом по времени
-    (retention_hours * 2): если задача была удалена, а её файл каким-то
-    образом остался, он не будет лежать вечно, но и не будет удалён
-    слишком рано, если что-то пошло не так.
-
-    При ошибке в одной итерации (например, недоступен диск) цикл
-    не завершается — sleep на 60 секунд и продолжение. Так фоновая
-    задача не падает молча при временных сбоях.
-    """
+    """Фоновый цикл автоочистки завершённых задач и осиротевших файлов."""
     while True:
         try:
+            jm = get_job_manager()
             hours = int(store.get("server.retention_hours"))
             interval = int(store.get("server.cleanup_interval_min"))
-            removed = job_manager.cleanup_expired(hours)
-            orphans = job_manager.cleanup_orphan_files(env.upload_dir, max_age_hours=hours * 2)
+            removed = jm.cleanup_expired(hours)
+            orphans = jm.cleanup_orphan_files(env.upload_dir, max_age_hours=hours * 2)
             if removed or orphans:
                 print(f"[cleanup] Удалено задач: {removed}, файлов: {orphans}")
             time.sleep(interval * 60)
@@ -155,14 +141,18 @@ def _cleanup_loop() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     """
-    Инициализация при старте приложения.
-
-    Создаёт рабочие папки (если их нет) и запускает фоновый поток
-    автоочистки. Daemon-флаг гарантирует, что поток завершится вместе
-    с основным процессом, а не заблокирует выключение сервера.
+    Инициализирует репозиторий, помечает прерванные задачи и запускает
+    фоновую очистку.
     """
     env.upload_dir.mkdir(parents=True, exist_ok=True)
     env.models_dir.mkdir(parents=True, exist_ok=True)
+
+    repo = get_repository()
+    interrupted = repo.mark_interrupted()
+    if interrupted:
+        print(f"[startup] Помечено прерванных задач: {interrupted}")
+
+    init_job_manager(repo=repo)
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
@@ -346,17 +336,8 @@ async def locale_get(lang: str) -> Dict[str, str]:
 
 @app.get("/api/jobs", tags=["jobs"], summary="Список всех задач")
 async def list_jobs() -> Dict[str, Any]:
-    """
-    Возвращает краткий список всех задач.
-
-    Отсортирован от новых к старым. Каждая запись содержит только
-    метаданные без логов и сегментов — это позволяет UI быстро
-    отрисовать список истории, не выкачивая мегабайты текста.
-
-    Returns:
-        Словарь {"jobs": [...]} с summary() каждой задачи.
-    """
-    return {"jobs": [j.summary() for j in job_manager.list()]}
+    """Возвращает краткий список всех задач, отсортированный от новых к старым."""
+    return {"jobs": get_job_manager().list_summaries(limit=200)}
 
 
 @app.post(
@@ -418,7 +399,8 @@ async def create_job(
     max_mb = int(store.get("server.max_upload_mb"))
     max_bytes = max_mb * 1024 * 1024
 
-    job = job_manager.create(
+    jm = get_job_manager()
+    job = jm.create(
         filename=file.filename,
         file_path="",
         file_size=0,
@@ -429,6 +411,8 @@ async def create_job(
 
     file_path = env.upload_dir / f"{job.id}{ext}"
     job.file_path = str(file_path)
+    if jm._repo:
+        jm._repo.update_job(job.id, file_path=str(file_path))
 
     size = 0
     try:
@@ -438,7 +422,7 @@ async def create_job(
                 if size > max_bytes:
                     f.close()
                     file_path.unlink(missing_ok=True)
-                    job_manager.delete(job.id)
+                    jm.delete(job.id)
                     raise HTTPException(413, f"Файл превышает лимит {max_mb} МБ")
                 f.write(chunk)
         job.file_size = size
@@ -446,7 +430,7 @@ async def create_job(
         raise
     except Exception as e:
         file_path.unlink(missing_ok=True)
-        job_manager.delete(job.id)
+        jm.delete(job.id)
         raise HTTPException(500, f"Ошибка сохранения: {e}")
 
     job.log("info", f"Задача {job.id} создана: {file.filename} ({size / 1024 / 1024:.1f} МБ)")
@@ -456,50 +440,62 @@ async def create_job(
     return {"job_id": job.id, "status": "pending"}
 
 
-@app.get("/api/jobs/{job_id}", tags=["jobs"], summary="Полный снимок задачи")
-async def get_job(job_id: str) -> Dict[str, Any]:
+@app.patch(
+    "/api/jobs/{job_id}/notes",
+    tags=["jobs"],
+    summary="Обновить теги и заметки задачи",
+    description="Принимает JSON вида `{\"tags\": [\"встреча\"], \"notes\": \"текст\"}`. "
+                "Оба поля опциональны — можно менять по отдельности.",
+)
+async def update_job_notes(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Возвращает полный снимок состояния задачи.
-
-    В отличие от /api/jobs (списка), здесь включены логи, сегменты
-    и полный текст. Используется для восстановления UI без SSE,
-    например после F5 страницы.
+    Обновляет пользовательские теги и заметки задачи.
 
     Args:
         job_id: Идентификатор задачи.
+        payload: Словарь с полями tags (list[str]) и/или notes (str).
 
     Returns:
-        Полный snapshot задачи.
+        Словарь {"ok": True, "tags": [...], "notes": "..."}.
 
     Raises:
-        HTTPException: 404, если задача не найдена.
+        HTTPException: 404, если задача не найдена;
+                       400, если типы полей некорректны.
     """
-    job = job_manager.get(job_id)
-    if not job:
+    tags = payload.get("tags")
+    notes = payload.get("notes")
+
+    if tags is not None and not isinstance(tags, list):
+        raise HTTPException(400, "tags должен быть массивом строк")
+    if tags is not None:
+        tags = [str(t).strip()[:32] for t in tags if str(t).strip()][:16]
+    if notes is not None and not isinstance(notes, str):
+        raise HTTPException(400, "notes должен быть строкой")
+    if notes is not None:
+        notes = notes[:10000]
+
+    repo = get_repository()
+    ok = repo.update_notes(job_id, tags=tags, notes=notes)
+    if not ok:
         raise HTTPException(404, "Задача не найдена")
-    return job.snapshot()
+
+    snap = repo.get_job(job_id)
+    return {"ok": True, "tags": snap.get("tags", []), "notes": snap.get("notes", "")}
+
+
+@app.get("/api/jobs/{job_id}", tags=["jobs"], summary="Полный снимок задачи")
+async def get_job(job_id: str) -> Dict[str, Any]:
+    """Возвращает полный снимок задачи из памяти или из БД."""
+    snap = get_job_manager().get_snapshot(job_id)
+    if not snap:
+        raise HTTPException(404, "Задача не найдена")
+    return snap
 
 
 @app.post("/api/jobs/{job_id}/cancel", tags=["jobs"], summary="Отменить задачу")
 async def cancel_job(job_id: str) -> Dict[str, bool]:
-    """
-    Запрашивает отмену задачи.
-
-    Отмена не мгновенная: воркер проверяет флаг между шагами и
-    завершает работу при первой возможности. Ответ приходит сразу
-    после установки флага, а фактическое завершение придёт через SSE
-    событием type="cancelled".
-
-    Args:
-        job_id: Идентификатор задачи.
-
-    Returns:
-        Словарь {"ok": True}.
-
-    Raises:
-        HTTPException: 404, если задача не найдена.
-    """
-    job = job_manager.get(job_id)
+    """Запрашивает отмену задачи."""
+    job = get_job_manager().get(job_id)
     if not job:
         raise HTTPException(404, "Задача не найдена")
     job.cancel()
@@ -508,23 +504,8 @@ async def cancel_job(job_id: str) -> Dict[str, bool]:
 
 @app.delete("/api/jobs/{job_id}", tags=["jobs"], summary="Удалить задачу")
 async def delete_job(job_id: str) -> Dict[str, bool]:
-    """
-    Удаляет задачу вместе с её файлом.
-
-    Если задача ещё выполняется, удаление не остановит воркер —
-    он продолжит работать, но при попытке обратиться к задаче
-    через API получит 404.
-
-    Args:
-        job_id: Идентификатор задачи.
-
-    Returns:
-        Словарь {"ok": True}.
-
-    Raises:
-        HTTPException: 404, если задача не найдена.
-    """
-    ok = job_manager.delete(job_id, remove_file=True)
+    """Удаляет задачу вместе с её файлом."""
+    ok = get_job_manager().delete(job_id, remove_file=True)
     if not ok:
         raise HTTPException(404, "Задача не найдена")
     return {"ok": True}
@@ -551,38 +532,36 @@ def _sse(event: Dict) -> str:
     "/api/jobs/{job_id}/stream",
     tags=["jobs"],
     summary="SSE-поток событий задачи",
-    description="Первым сообщением всегда идёт `snapshot` с полным состоянием. "
-                "Затем — live-события: `log`, `progress`, `status`, `segment`. "
-                "Поток закрывается после `done`, `error` или `cancelled`.",
-    response_class=StreamingResponse,
+    description="Первым сообщением идёт snapshot с полным состоянием. "
+                "Для завершённых задач поток закрывается сразу. "
+                "Для активных — транслируются live-события до done/error/cancelled.",
 )
 async def stream_job(job_id: str) -> StreamingResponse:
-    """
-    Открывает SSE-поток событий по задаче.
+    """Открывает SSE-поток событий по задаче."""
+    jm = get_job_manager()
+    job = jm.get(job_id)
 
-    Первым сообщением всегда идёт snapshot с полным текущим состоянием
-    — это позволяет клиенту мгновенно восстановить UI после
-    переподключения, не дожидаясь новых событий. Затем идёт поток
-    live-событий: log, progress, status, segment.
-
-    Если задача уже завершена к моменту подключения, поток закрывается
-    сразу после отправки snapshot и одного финального события.
-
-    Поток корректно отписывается от очереди в finally, даже если
-    клиент оборвал соединение — иначе подписчики копились бы в памяти.
-
-    Args:
-        job_id: Идентификатор задачи.
-
-    Returns:
-        StreamingResponse с media_type="text/event-stream".
-
-    Raises:
-        HTTPException: 404, если задача не найдена.
-    """
-    job = job_manager.get(job_id)
     if not job:
-        raise HTTPException(404, "Задача не найдена")
+        snap = jm.get_snapshot(job_id)
+        if not snap:
+            raise HTTPException(404, "Задача не найдена")
+
+        async def gen_finished():
+            yield _sse({"type": "snapshot", "data": snap})
+            final_type = "done" if snap["status"] == "done" else (
+                "error" if snap["status"] in ("error", "interrupted") else "cancelled"
+            )
+            yield _sse({
+                "type": final_type,
+                "text": snap.get("text", ""),
+                "metadata": snap.get("metadata", {}),
+                "message": snap.get("error"),
+            })
+
+        return StreamingResponse(
+            gen_finished(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     queue: asyncio.Queue = asyncio.Queue()
     job._subscribers.append(queue)
@@ -591,14 +570,6 @@ async def stream_job(job_id: str) -> StreamingResponse:
     async def gen():
         try:
             yield _sse({"type": "snapshot", "data": snapshot})
-            if job.status in ("done", "error", "cancelled"):
-                yield _sse({
-                    "type": job.status if job.status != "done" else "done",
-                    "text": job.text,
-                    "metadata": job.metadata,
-                    "message": job.error,
-                })
-                return
             while True:
                 event = await queue.get()
                 yield _sse(event)
@@ -614,30 +585,19 @@ async def stream_job(job_id: str) -> StreamingResponse:
     )
 
 
-@app.get("/api/jobs/{job_id}/result", tags=["jobs"], summary="Финальный результат задачи")
+@app.get("/api/jobs/{job_id}/result", tags=["jobs"], summary="Финальный результат")
 async def get_result(job_id: str) -> Dict[str, Any]:
-    """
-    Возвращает финальный результат задачи в структурированном виде.
-
-    Используется как альтернатива SSE для сценариев, где поток неудобен:
-    скрипты, curl, экспорт через API.
-
-    Args:
-        job_id: Идентификатор задачи.
-
-    Returns:
-        Словарь {"text": ..., "segments": [...], "metadata": {...}}.
-
-    Raises:
-        HTTPException: 404, если задача не найдена;
-            409, если задача ещё не завершена.
-    """
-    job = job_manager.get(job_id)
-    if not job:
+    """Возвращает финальный результат задачи."""
+    snap = get_job_manager().get_snapshot(job_id)
+    if not snap:
         raise HTTPException(404, "Задача не найдена")
-    if job.status != "done":
-        raise HTTPException(409, f"Задача ещё не готова ({job.status})")
-    return {"text": job.text, "segments": job.segments, "metadata": job.metadata}
+    if snap["status"] != "done":
+        raise HTTPException(409, f"Задача ещё не готова ({snap['status']})")
+    return {
+        "text": snap.get("text", ""),
+        "segments": snap.get("segments", []),
+        "metadata": snap.get("metadata", {}),
+    }
 
 
 app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")

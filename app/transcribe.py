@@ -15,6 +15,7 @@ server.py мог валидировать вход до запуска ворк�
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -25,6 +26,7 @@ from typing import Any, Dict
 
 from .config import get_env, get_store
 from .jobs import Job
+from . import media_info
 
 SUPPORTED_AUDIO = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".wma", ".aac", ".opus"}
 SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".ts"}
@@ -218,33 +220,21 @@ def run(job: Job) -> None:
     """
     Выполняет полный цикл транскрибации задачи.
 
-    Этапы:
-        1. Извлечение аудио из видео (только для видеофайлов).
-        2. Проверка/скачивание модели (прогресс 2–30%).
-        3. Загрузка модели в GPU/CPU (прогресс 32–35%).
-        4. Транскрибация с потоковой выдачей сегментов (35–100%).
-
-    Все события (логи, прогресс, сегменты, финал) публикуются через
-    методы Job и не возвращаются из функции. Это позволяет UI получать
-    обновления через SSE в реальном времени, пока воркер ещё работает.
-
-    Функция не бросает исключений наружу: любые ошибки оборачиваются
-    в job.set_status("error", ...) и публикуются как SSE-событие.
-    Отмена задачи проверяется через job.is_cancelled() между этапами
-    и на каждой итерации по сегментам.
-
-    Временные аудиофайлы удаляются в finally — включая случай ошибки
-    или отмены. Родительская папка удаляется, только если она внутри
-    системной temp-директории, чтобы не задеть пользовательские данные.
+    Собирает метаданные исходного файла и статистику обработки: время
+    каждого этапа, пик VRAM, RTF. Всё это сохраняется в БД по завершении
+    (или при ошибке/отмене) и доступно в детальном просмотре задачи.
 
     Args:
-        job: Задача со всеми параметрами обработки. Должна иметь
-            привязанный event loop через set_loop() для рассылки SSE.
-
-    Returns:
-        None. Результат доступен в job.text и job.metadata.
+        job: Задача со всеми параметрами обработки.
     """
     temp_audio = None
+    stats: Dict[str, Any] = {
+        "started_at": time.time(),
+        "stages": {},
+        "peak_vram_mb": 0,
+    }
+    stage_start = time.time()
+
     try:
         from faster_whisper import WhisperModel, BatchedInferencePipeline
 
@@ -252,23 +242,67 @@ def run(job: Job) -> None:
         model_name = job.model or settings["model"]
         language = job.language or (None if settings["language"] == "auto" else settings["language"])
 
+        # Сохраняем снимок настроек, использованных для этой задачи
+        settings_snapshot = {
+            "model": model_name,
+            "language": language or "auto",
+            "batch_size": settings["batch_size"],
+            "beam_size": settings["beam_size"],
+            "vad": settings["vad"],
+            "condition_on_previous": settings["condition_on_previous"],
+            "device": settings["device"],
+            "compute_type": settings["compute_type"],
+            "initial_prompt": settings["initial_prompt"],
+            "hotwords": settings["hotwords"],
+        }
+        if job._repo:
+            try:
+                job._repo.update_job(
+                    job.id,
+                    settings_snapshot=json.dumps(settings_snapshot, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
+        # Метаданные файла
+        job.log("info", "Чтение метаданных файла…")
+        src_meta = media_info.probe(job.file_path)
+        if src_meta:
+            if src_meta.get("duration"):
+                job.log("info", f"Длительность источника: {_fmt_ts(src_meta['duration'])}")
+            if src_meta.get("format_name"):
+                job.log("info", f"Формат: {src_meta['format_name']}")
+            if job._repo:
+                try:
+                    job._repo.update_job(
+                        job.id,
+                        source_metadata=json.dumps(src_meta, ensure_ascii=False),
+                    )
+                except Exception:
+                    pass
+        stage_start = time.time()
+
         audio_path = job.file_path
         if Path(job.file_path).suffix.lower() in SUPPORTED_VIDEO:
             job.set_status("downloading", "Извлечение аудио…")
             temp_audio = _extract_audio(job, job.file_path)
             audio_path = temp_audio
+        stats["stages"]["extract_audio"] = round(time.time() - stage_start, 2)
 
         if job.is_cancelled():
             raise InterruptedError()
 
+        stage_start = time.time()
         job.set_status("downloading", "Подготовка модели…")
         job.set_progress(2, "Проверка кэша…", "downloading")
         job.log("info", f"Модель: {model_name}")
         model_path = _ensure_model(job, model_name)
+        stats["stages"]["download_model"] = round(time.time() - stage_start, 2)
 
         if job.is_cancelled():
             raise InterruptedError()
 
+        stage_start = time.time()
         job.set_status("loading", "Загрузка модели…")
         job.set_progress(32, "Загрузка в GPU…", "loading")
         device = settings["device"]
@@ -279,6 +313,7 @@ def run(job: Job) -> None:
         model = WhisperModel(model_path, device=device, compute_type=compute)
         batched = BatchedInferencePipeline(model=model)
         job.log("success", f"Модель загружена за {time.time() - t0:.1f} с")
+        stats["stages"]["load_model"] = round(time.time() - stage_start, 2)
 
         if job.is_cancelled():
             raise InterruptedError()
@@ -313,6 +348,7 @@ def run(job: Job) -> None:
         job.log("info", f"Длительность: {_fmt_ts(total_duration)}")
 
         text_parts = []
+        peak_vram = 0
         for i, seg in enumerate(segments):
             if job.is_cancelled():
                 raise InterruptedError()
@@ -321,6 +357,9 @@ def run(job: Job) -> None:
                 continue
             job.add_segment(seg.start, seg.end, text)
             text_parts.append(text)
+
+            if i % 20 == 0:
+                peak_vram = max(peak_vram, _get_gpu_used_mb())
 
             if total_duration > 0 and seg.end > 0:
                 pct = 35 + int((seg.end / total_duration) * 64)
@@ -333,6 +372,11 @@ def run(job: Job) -> None:
             )
 
         proc_time = time.time() - t_start
+        stats["stages"]["transcribe"] = round(proc_time, 2)
+        stats["peak_vram_mb"] = peak_vram
+        stats["total_seconds"] = round(time.time() - stats["started_at"], 2)
+        stats["rtf"] = round(proc_time / max(total_duration, 0.01), 3)
+
         job.text = "\n".join(text_parts)
         job.metadata = {
             "language": getattr(info, "language", "?"),
@@ -343,22 +387,54 @@ def run(job: Job) -> None:
             "processing_time": proc_time,
             "speed_factor": round(total_duration / max(proc_time, 0.01), 2),
         }
+        if job._repo:
+            try:
+                job._repo.update_job(
+                    job.id,
+                    processing_stats=json.dumps(stats, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
         job.set_progress(100, "Готово!", "done")
         job.set_status("done", "Транскрибация завершена")
         job.finished_at = time.time()
         job.log("success", f"Готово за {proc_time:.1f} с. Символов: {len(job.text):,}")
+        job.persist_final()
         job.emit({"type": "done", "text": job.text, "metadata": job.metadata})
 
     except InterruptedError:
+        stats["total_seconds"] = round(time.time() - stats["started_at"], 2)
+        if job._repo:
+            try:
+                job._repo.update_job(
+                    job.id,
+                    processing_stats=json.dumps(stats, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+        job.finished_at = time.time()
         job.set_status("cancelled", "Отменено")
         job.log("warn", "Транскрибация отменена")
+        job.persist_final()
         job.emit({"type": "cancelled"})
     except Exception as e:
+        stats["total_seconds"] = round(time.time() - stats["started_at"], 2)
+        if job._repo:
+            try:
+                job._repo.update_job(
+                    job.id,
+                    processing_stats=json.dumps(stats, ensure_ascii=False),
+                )
+            except Exception:
+                pass
         err = f"{type(e).__name__}: {e}"
         job.error = err
+        job.finished_at = time.time()
         job.set_status("error", err)
         job.log("error", err)
         job.log("error", traceback.format_exc())
+        job.persist_final()
         job.emit({"type": "error", "message": err})
     finally:
         if temp_audio and os.path.exists(temp_audio):
@@ -372,3 +448,19 @@ def run(job: Job) -> None:
                         pass
             except OSError:
                 pass
+
+
+def _get_gpu_used_mb() -> int:
+    """
+    Возвращает текущее использование VRAM в мегабайтах.
+
+    Returns:
+        Использовано МБ или 0, если GPU недоступна.
+    """
+    try:
+        import pynvml
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return round(mem.used / (1024 ** 2))
+    except Exception:
+        return 0

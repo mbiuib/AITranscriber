@@ -1,14 +1,12 @@
 """
 Менеджер задач: создание, хранение, очистка.
 
-Задача (Job) — это единица работы по транскрибации одного файла. Она
-хранит состояние, прогресс, логи, сегменты и результат. JobManager
-управляет жизненным циклом задач: создаёт, хранит, удаляет по запросу
-и по истечении срока хранения.
+Задачи живут в двух местах: активные — в памяти (для быстрого SSE),
+завершённые — в SQLite (переживают перезапуск сервера). JobManager
+координирует оба источника.
 
-Задачи живут в памяти процесса и не переживают перезапуск сервера.
-Для сохранения истории между запусками потребуется внешнее хранилище
-(SQLite, Redis) — сейчас это не реализовано.
+Задача (Job) — единица работы по транскрибации одного файла. Она
+хранит состояние, прогресс, логи, сегменты и результат.
 """
 from __future__ import annotations
 
@@ -19,7 +17,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .storage import JobRepository
 
 
 @dataclass
@@ -27,34 +28,31 @@ class Job:
     """
     Единица работы по транскрибации одного файла.
 
-    Хранит входные параметры, текущее состояние обработки, накопленные
-    логи и сегменты текста, а также метаданные по завершении. Умеет
-    рассылать события SSE-подписчикам через emit().
+    Класс не потокобезопасен сам по себе — мутирующие методы предполагают
+    вызов из одного потока (воркера). emit() безопасен к вызову из другого
+    потока за счёт call_soon_threadsafe.
 
-    Задача не потокобезопасна сама по себе — предполагается, что все
-    вызовы мутирующих методов идут из одного потока (воркера), а emit()
-    безопасен к вызову из другого потока благодаря call_soon_threadsafe.
+    При наличии _repo изменения автоматически сохраняются в БД: логи
+    и сегменты сразу, прогресс — с дедупликацией по времени.
 
     Attributes:
         id: Уникальный 12-символьный идентификатор задачи.
         filename: Исходное имя загруженного файла.
-        file_path: Путь к сохранённому файлу на диске.
+        file_path: Путь к файлу на диске.
         file_size: Размер файла в байтах.
-        model: Название модели Whisper (например, "large-v3").
+        model: Название модели Whisper.
         language: Код языка или None для автоопределения.
-        status: Общий статус задачи: pending, downloading, loading,
-            transcribing, done, error, cancelled.
-        stage: Более детальная стадия для UI (совпадает с status
-            в большинстве случаев, но может уточняться).
-        progress: Прогресс в процентах от 0 до 100.
+        status: pending, downloading, loading, transcribing, done, error, cancelled, interrupted.
+        stage: Стадия для UI (совпадает со status в большинстве случаев).
+        progress: Прогресс от 0 до 100.
         message: Человекочитаемое описание текущего действия.
-        logs: Накопленные записи логов (ограничено 5000 последних).
-        segments: Распознанные сегменты текста с таймкодами.
-        text: Полный распознанный текст (склеен из сегментов).
+        logs: Накопленные записи логов (в памяти).
+        segments: Распознанные сегменты текста (в памяти).
+        text: Полный распознанный текст.
         metadata: Итоговые метаданные (язык, длительность, скорость).
         error: Текст ошибки, если задача завершилась неудачно.
         created_at: Unix-время создания задачи.
-        finished_at: Unix-время завершения (успешного или нет).
+        finished_at: Unix-время завершения.
     """
 
     id: str
@@ -81,32 +79,36 @@ class Job:
     _subscribers: List[asyncio.Queue] = field(default_factory=list)
     _loop: Optional[asyncio.AbstractEventLoop] = None
     _cancelled: bool = False
+    _repo: Optional["JobRepository"] = None
+    _last_progress_save: float = 0.0
+
+    def attach_repo(self, repo: "JobRepository") -> None:
+        """
+        Привязывает задачу к репозиторию для автосохранения.
+
+        Args:
+            repo: Экземпляр JobRepository.
+        """
+        self._repo = repo
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """
-        Привязывает задачу к event loop, в котором будут рассылаться события.
-
-        Обязательный шаг перед использованием emit() из воркера. Обычно
-        вызывается один раз при создании задачи в HTTP-обработчике, где
-        доступен текущий loop через asyncio.get_running_loop().
+        Привязывает задачу к event loop для рассылки SSE-событий.
 
         Args:
-            loop: Event loop главного потока, куда будут доставляться
-                события SSE-подписчиков.
+            loop: Event loop главного потока.
         """
         self._loop = loop
 
     def emit(self, event: Dict) -> None:
         """
-        Рассылает событие всем активным SSE-подписчикам.
+        Рассылает событие всем SSE-подписчикам.
 
-        Потокобезопасна: использует call_soon_threadsafe, чтобы передать
-        событие в event loop главного потока. Если loop ещё не привязан
-        через set_loop() или уже закрыт, событие молча отбрасывается —
-        это нормально на ранних этапах жизненного цикла задачи.
+        Потокобезопасен. Если loop не привязан или закрыт, событие
+        молча отбрасывается.
 
         Args:
-            event: Словарь с полем "type" и произвольной полезной нагрузкой.
+            event: Словарь события с полем "type".
         """
         if self._loop is None:
             return
@@ -118,109 +120,150 @@ class Job:
 
     def log(self, level: str, message: str) -> None:
         """
-        Добавляет запись в лог задачи и рассылает её подписчикам.
+        Добавляет запись в лог и рассылает её подписчикам.
 
-        Лог ограничен 5000 последними записями: при превышении старые
-        удаляются пачкой по 1000, чтобы не резать историю на каждой
-        строке.
+        В памяти хранится не больше 5000 записей; та же политика
+        применяется в БД на стороне репозитория.
 
         Args:
-            level: Уровень: "info", "success", "warn", "error", "debug".
+            level: info, success, warn, error, debug.
             message: Текст записи.
         """
         entry = {"time": time.time(), "level": level, "message": message}
         self.logs.append(entry)
         if len(self.logs) > 5000:
             self.logs = self.logs[-4000:]
+        if self._repo:
+            try:
+                self._repo.append_log(self.id, entry)
+            except Exception:
+                pass
         self.emit({"type": "log", "entry": entry})
 
     def set_progress(self, value: int, message: str = "", stage: str = None) -> None:
         """
-        Обновляет прогресс задачи и рассылает событие подписчикам.
+        Обновляет прогресс и рассылает событие.
 
-        Значение автоматически зажимается в диапазон [0, 100]. Пустые
-        message и stage не затирают ранее установленные значения — это
-        позволяет обновлять только процент без потери контекста.
+        Значение зажимается в [0, 100]. Пустые message и stage не затирают
+        предыдущие. В БД сохраняется не чаще раза в секунду — при быстрых
+        обновлениях прогресса (десятки раз в секунду) запись дебаунсится.
 
         Args:
-            value: Прогресс в процентах (0–100).
-            message: Описание текущего действия (опционально).
-            stage: Новая стадия обработки (опционально).
+            value: Прогресс в процентах (0-100).
+            message: Описание текущего действия.
+            stage: Новая стадия обработки.
         """
         self.progress = max(0, min(100, value))
         if message:
             self.message = message
         if stage:
             self.stage = stage
+
+        now = time.time()
+        if self._repo and (now - self._last_progress_save >= 1.0):
+            self._last_progress_save = now
+            try:
+                self._repo.update_job(
+                    self.id,
+                    progress=self.progress,
+                    message=self.message,
+                    stage=self.stage,
+                )
+            except Exception:
+                pass
+
         self.emit({
-            "type": "progress", "value": self.progress,
-            "message": self.message, "stage": self.stage,
+            "type": "progress",
+            "value": self.progress,
+            "message": self.message,
+            "stage": self.stage,
         })
 
     def set_status(self, status: str, message: str = "") -> None:
         """
-        Меняет статус задачи и рассылает событие подписчикам.
+        Меняет статус задачи и рассылает событие.
 
         Args:
-            status: Новый статус из фиксированного набора: pending,
-                downloading, loading, transcribing, done, error, cancelled.
-            message: Дополнительное описание (опционально).
+            status: Новый статус.
+            message: Дополнительное описание.
         """
         self.status = status
         if message:
             self.message = message
+        if self._repo:
+            try:
+                self._repo.update_job(
+                    self.id, status=self.status, message=self.message,
+                )
+            except Exception:
+                pass
         self.emit({"type": "status", "status": self.status, "message": self.message})
 
     def add_segment(self, start: float, end: float, text: str) -> None:
         """
-        Добавляет распознанный сегмент и рассылает событие подписчикам.
+        Добавляет сегмент и рассылает событие.
 
-        Индекс сегмента назначается автоматически и отражает порядок
-        поступления. UI использует его для нумерации строк.
+        Индекс назначается автоматически. Сегмент сразу сохраняется
+        в БД — на случай, если сервер упадёт во время длинной задачи.
 
         Args:
-            start: Начало сегмента в секундах от начала аудио.
+            start: Начало сегмента в секундах.
             end: Конец сегмента в секундах.
-            text: Распознанный текст сегмента (уже обрезанный по краям).
+            text: Распознанный текст.
         """
         seg = {"index": len(self.segments), "start": start, "end": end, "text": text}
         self.segments.append(seg)
+        if self._repo:
+            try:
+                self._repo.append_segment(self.id, seg["index"], start, end, text)
+            except Exception:
+                pass
         self.emit({"type": "segment", "segment": seg})
 
-    def cancel(self) -> None:
+    def persist_final(self) -> None:
         """
-        Запрашивает отмену задачи.
+        Сохраняет финальное состояние задачи в БД.
 
-        Воркер проверяет флаг через is_cancelled() между шагами обработки
-        и корректно завершает работу. Мгновенной остановки не происходит —
-        нельзя прервать уже запущенный батч инференса, но следующий шаг
-        не начнётся.
+        Вызывается один раз при завершении (успешном или нет). Записывает
+        текстовый результат, метаданные, ошибку и время завершения —
+        то, что не сохранялось по ходу обработки.
         """
+        if not self._repo:
+            return
+        try:
+            self._repo.update_job(
+                self.id,
+                status=self.status,
+                stage=self.stage,
+                progress=self.progress,
+                message=self.message,
+                text=self.text,
+                metadata=self.metadata,
+                error=self.error,
+                finished_at=self.finished_at,
+            )
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        """Запрашивает отмену задачи."""
         self._cancelled = True
 
     def is_cancelled(self) -> bool:
-        """
-        Проверяет, запрошена ли отмена задачи.
-
-        Returns:
-            True, если был вызван cancel().
-        """
+        """Проверяет, запрошена ли отмена."""
         return self._cancelled
 
     def snapshot(self) -> Dict:
         """
         Возвращает полный снимок состояния задачи.
 
-        Используется при первичной подписке на SSE — клиент получает всё
-        накопленное состояние одним куском, чтобы восстановить UI после
-        переподключения.
-
         Returns:
-            Словарь со всеми полями задачи, включая логи и сегменты.
+            Словарь со всеми полями, включая логи и сегменты.
         """
         return {
             "id": self.id,
             "filename": self.filename,
+            "file_path": self.file_path,
             "file_size": self.file_size,
             "model": self.model,
             "language": self.language,
@@ -239,15 +282,10 @@ class Job:
 
     def summary(self) -> Dict:
         """
-        Возвращает краткую версию состояния для списка истории.
-
-        В отличие от snapshot(), не включает логи, сегменты и полный
-        текст — только метаданные, необходимые для отображения строки
-        в списке задач.
+        Возвращает краткую версию для списка истории.
 
         Returns:
-            Словарь с ключевыми полями: id, filename, статус, количество
-            сегментов, длительность, язык и временные метки.
+            Словарь без логов и сегментов — только для отрисовки строки.
         """
         return {
             "id": self.id,
@@ -266,141 +304,206 @@ class Job:
 
 class JobManager:
     """
-    Хранилище задач в памяти процесса.
+    Координатор активных (в памяти) и завершённых (в БД) задач.
 
-    Управляет созданием, поиском, удалением и периодической очисткой
-    задач. Все публичные методы потокобезопасны — защищены общим RLock.
-
-    При удалении задачи опционально удаляется её файл с диска. Также
-    поддерживается очистка «осиротевших» файлов — тех, что лежат в
-    uploads/, но не связаны ни с одной активной задачей (например,
-    остатки от упавших загрузок).
+    Активные задачи находятся в _jobs и обновляются в реальном времени.
+    После завершения Job остаётся в памяти до перезапуска сервера или
+    до явного удаления, но её состояние уже полностью сохранено в БД.
+    Если задача запрошена по ID, а её нет в памяти — загружается из БД.
 
     Attributes:
-        _jobs: Словарь id → Job.
-        _lock: RLock, защищающий _jobs от одновременного доступа.
+        _jobs: Активные задачи в памяти.
+        _repo: Репозиторий SQLite для хранения истории.
+        _lock: RLock, защищающий _jobs от гонок.
     """
 
-    def __init__(self):
-        """Создаёт пустое хранилище задач."""
+    def __init__(self, repo: Optional["JobRepository"] = None):
+        """
+        Создаёт пустой менеджер.
+
+        Args:
+            repo: Репозиторий SQLite. Если None — история не сохраняется
+                (режим без БД, полезно для тестов).
+        """
         self._jobs: Dict[str, Job] = {}
+        self._repo = repo
         self._lock = threading.RLock()
 
     def create(self, **kwargs) -> Job:
         """
-        Создаёт задачу и регистрирует её в хранилище.
+        Создаёт задачу, сохраняет её в БД и регистрирует в памяти.
 
         Args:
-            **kwargs: Поля Job без id — id генерируется автоматически
-                как 12-символьный hex-идентификатор.
+            **kwargs: Поля Job без id.
 
         Returns:
-            Созданный экземпляр Job.
+            Созданный экземпляр Job с привязанным репозиторием.
         """
         with self._lock:
             job = Job(id=uuid.uuid4().hex[:12], **kwargs)
+            job.attach_repo(self._repo) if self._repo else None
             self._jobs[job.id] = job
+            if self._repo:
+                try:
+                    self._repo.create_job({
+                        "id": job.id,
+                        "filename": job.filename,
+                        "file_path": job.file_path,
+                        "file_size": job.file_size,
+                        "model": job.model,
+                        "language": job.language,
+                        "status": job.status,
+                        "stage": job.stage,
+                        "progress": job.progress,
+                        "message": job.message,
+                        "text": job.text,
+                        "metadata": job.metadata,
+                        "error": job.error,
+                        "created_at": job.created_at,
+                        "finished_at": job.finished_at,
+                    })
+                except Exception:
+                    pass
             return job
 
     def get(self, job_id: str) -> Optional[Job]:
         """
-        Возвращает задачу по идентификатору.
+        Возвращает Job из памяти (только активные и недавно завершённые).
 
         Args:
             job_id: Идентификатор задачи.
 
         Returns:
-            Экземпляр Job или None, если задача не найдена.
+            Job или None, если задачи нет в памяти.
         """
         with self._lock:
             return self._jobs.get(job_id)
 
-    def list(self) -> List[Job]:
+    def get_snapshot(self, job_id: str) -> Optional[Dict]:
         """
-        Возвращает все задачи, отсортированные по времени создания.
-
-        Свежие задачи идут первыми — это ожидаемый порядок для списка
-        истории в UI.
-
-        Returns:
-            Список задач от новых к старым.
-        """
-        with self._lock:
-            return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
-
-    def delete(self, job_id: str, remove_file: bool = True) -> bool:
-        """
-        Удаляет задачу и опционально её файл с диска.
+        Возвращает полный снимок задачи — из памяти или из БД.
 
         Args:
             job_id: Идентификатор задачи.
-            remove_file: Удалять ли связанный файл. Ошибки удаления
-                файла игнорируются — задача всё равно снимается с учёта.
 
         Returns:
-            True, если задача была найдена и удалена, False в противном случае.
+            Словарь-снимок задачи или None, если не найдена.
         """
+        job = self.get(job_id)
+        if job:
+            return job.snapshot()
+        if self._repo:
+            return self._repo.get_job(job_id)
+        return None
+
+    def list_summaries(self, limit: int = 200, offset: int = 0) -> List[Dict]:
+        """
+        Возвращает краткий список задач.
+
+        Если репозиторий есть — читает из БД (там все задачи, включая
+        завершённые). Если репозитория нет — только из памяти.
+
+        Args:
+            limit: Максимум записей.
+            offset: Смещение для пагинации.
+
+        Returns:
+            Список словарей-сводок, отсортированный от новых к старым.
+        """
+        if self._repo:
+            return self._repo.list_summaries(limit=limit, offset=offset)
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+            return [j.summary() for j in jobs[offset:offset + limit]]
+
+    def delete(self, job_id: str, remove_file: bool = True) -> bool:
+        """
+        Удаляет задачу из памяти и из БД, опционально — файл с диска.
+
+        Args:
+            job_id: Идентификатор задачи.
+            remove_file: Удалять ли связанный файл.
+
+        Returns:
+            True, если задача была найдена и удалена.
+        """
+        file_path = None
         with self._lock:
             job = self._jobs.pop(job_id, None)
-        if not job:
-            return False
-        if remove_file and job.file_path and os.path.exists(job.file_path):
+            if job:
+                file_path = job.file_path
+            elif self._repo:
+                snap = self._repo.get_job(job_id)
+                if not snap:
+                    return False
+                file_path = snap.get("file_path")
+
+        if self._repo:
+            self._repo.delete_job(job_id)
+
+        if remove_file and file_path and os.path.exists(file_path):
             try:
-                os.remove(job.file_path)
+                os.remove(file_path)
             except OSError:
                 pass
+
         return True
 
     def cleanup_expired(self, retention_hours: int) -> int:
         """
         Удаляет завершённые задачи старше указанного срока.
 
-        Учитываются только задачи с заполненным finished_at — то есть
-        завершённые (успешно или с ошибкой). Активные задачи не трогаются
-        независимо от их возраста.
-
         Args:
-            retention_hours: Сколько часов хранить задачи после завершения.
+            retention_hours: Сколько часов хранить завершённые задачи.
 
         Returns:
             Количество удалённых задач.
         """
+        if not self._repo:
+            return 0
         cutoff = time.time() - retention_hours * 3600
-        removed = 0
+        ids = self._repo.delete_finished_before(cutoff)
         with self._lock:
-            to_remove = [
-                j.id for j in self._jobs.values()
-                if j.finished_at and j.finished_at < cutoff
-            ]
-        for job_id in to_remove:
-            if self.delete(job_id):
-                removed += 1
-        return removed
+            for jid in ids:
+                job = self._jobs.pop(jid, None)
+                if job and job.file_path and os.path.exists(job.file_path):
+                    try:
+                        os.remove(job.file_path)
+                    except OSError:
+                        pass
+        return len(ids)
 
     def cleanup_orphan_files(self, upload_dir: Path, max_age_hours: int = 48) -> int:
         """
-        Удаляет файлы в upload_dir, на которые нет ссылок в задачах.
+        Удаляет файлы в upload_dir, на которые нет ссылок в БД.
 
         Такие файлы обычно остаются после неудачных загрузок или падений
-        процесса. Файлы младше max_age_hours не трогаются, чтобы не
-        удалить загрузку, которая идёт прямо сейчас.
+        процесса. Файлы младше max_age_hours не трогаются.
 
         Args:
             upload_dir: Папка с загруженными файлами.
-            max_age_hours: Минимальный возраст файла для удаления, в часах.
+            max_age_hours: Минимальный возраст файла для удаления.
 
         Returns:
             Количество удалённых файлов.
         """
         if not upload_dir.exists():
             return 0
-        active = {Path(j.file_path).name for j in self._jobs.values()}
+
+        active = set()
+        if self._repo:
+            with self._repo._lock:
+                cur = self._repo._conn.cursor()
+                cur.execute("SELECT file_path FROM jobs")
+                active = {Path(r["file_path"]).name for r in cur.fetchall()}
+                cur.close()
+        with self._lock:
+            active |= {Path(j.file_path).name for j in self._jobs.values()}
+
         cutoff = time.time() - max_age_hours * 3600
         removed = 0
         for f in upload_dir.iterdir():
-            if not f.is_file():
-                continue
-            if f.name in active:
+            if not f.is_file() or f.name in active:
                 continue
             try:
                 if f.stat().st_mtime < cutoff:
@@ -411,4 +514,37 @@ class JobManager:
         return removed
 
 
-job_manager = JobManager()
+job_manager: Optional[JobManager] = None
+
+
+def init_job_manager(repo: Optional["JobRepository"] = None) -> JobManager:
+    """
+    Инициализирует глобальный JobManager.
+
+    Вызывается один раз при старте сервера — после того как репозиторий
+    создан и все прерванные задачи помечены.
+
+    Args:
+        repo: Репозиторий SQLite (или None для работы без БД).
+
+    Returns:
+        Инициализированный JobManager.
+    """
+    global job_manager
+    job_manager = JobManager(repo=repo)
+    return job_manager
+
+
+def get_job_manager() -> JobManager:
+    """
+    Возвращает глобальный JobManager.
+
+    Returns:
+        Singleton JobManager.
+
+    Raises:
+        RuntimeError: Если init_job_manager() не был вызван.
+    """
+    if job_manager is None:
+        raise RuntimeError("JobManager не инициализирован. Вызовите init_job_manager().")
+    return job_manager

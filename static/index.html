@@ -261,6 +261,90 @@
   </div>
 </div>
 
+<!-- ============ Job Detail Modal ============ -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">
+        <span class="material-symbols-rounded">description</span>
+        <span id="detail-filename"></span>
+      </div>
+      <button class="modal-close" id="detail-close">
+        <span class="material-symbols-rounded">close</span>
+      </button>
+    </div>
+
+    <div class="modal-tabs">
+      <button class="modal-tab active" data-dtab="transcript">
+        <span class="material-symbols-rounded">subject</span>
+        Транскрипт
+      </button>
+      <button class="modal-tab" data-dtab="meta">
+        <span class="material-symbols-rounded">info</span>
+        Метаданные
+      </button>
+      <button class="modal-tab" data-dtab="stats">
+        <span class="material-symbols-rounded">speed</span>
+        Статистика
+      </button>
+      <button class="modal-tab" data-dtab="notes">
+        <span class="material-symbols-rounded">edit_note</span>
+        Заметки
+      </button>
+    </div>
+
+    <div class="modal-body">
+      <div class="modal-pane active" data-dpane="transcript">
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="d-act-copy">
+            <span class="material-symbols-rounded">content_copy</span>
+            Копировать
+          </button>
+          <button class="btn btn-ghost" id="d-act-txt">
+            <span class="material-symbols-rounded">description</span>
+            .txt
+          </button>
+          <button class="btn btn-ghost" id="d-act-srt">
+            <span class="material-symbols-rounded">subtitles</span>
+            .srt
+          </button>
+          <button class="btn btn-ghost" id="d-act-json">
+            <span class="material-symbols-rounded">data_object</span>
+            .json
+          </button>
+        </div>
+        <div class="modal-transcript" id="detail-transcript"></div>
+      </div>
+
+      <div class="modal-pane" data-dpane="meta">
+        <div id="detail-meta"></div>
+      </div>
+
+      <div class="modal-pane" data-dpane="stats">
+        <div id="detail-stats"></div>
+      </div>
+
+      <div class="modal-pane" data-dpane="notes">
+        <div class="notes-editor">
+          <label class="field-label">Теги</label>
+          <div class="tags-input" id="detail-tags">
+            <input type="text" id="detail-tag-input" placeholder="Введите тег и нажмите Enter">
+          </div>
+          <label class="field-label" style="margin-top: 16px">Заметки</label>
+          <textarea id="detail-notes" rows="8"
+                    placeholder="Личные заметки по этой записи…"></textarea>
+          <div style="margin-top: 12px; display: flex; gap: 8px;">
+            <button class="btn btn-primary" id="detail-save-notes">
+              <span class="material-symbols-rounded">save</span>
+              Сохранить
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ============ Toasts ============ -->
 <div class="toasts" id="toasts"></div>
 

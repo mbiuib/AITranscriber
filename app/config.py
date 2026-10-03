@@ -222,6 +222,16 @@ class EnvSettings(BaseSettings):
         """
         return self.max_upload_mb * 1024 * 1024
 
+    @property
+    def db_path(self) -> Path:
+        """
+        Путь к файлу SQLite с историей задач.
+
+        Returns:
+            Путь к data/jobs.db внутри data_dir_resolved.
+        """
+        return self.data_dir_resolved / "jobs.db"
+
 
 class SettingsStore:
     """
@@ -463,3 +473,22 @@ def apply_env_vars() -> None:
     if env.hf_transfer:
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(env.hf_download_timeout)
+
+
+_repo_singleton = None
+
+def get_repository():
+    """
+    Возвращает singleton JobRepository.
+
+    Импорт JobRepository внутри функции — чтобы избежать циклических
+    зависимостей между config.py и storage.py.
+
+    Returns:
+        Единственный на процесс экземпляр JobRepository.
+    """
+    global _repo_singleton
+    if _repo_singleton is None:
+        from .storage import JobRepository
+        _repo_singleton = JobRepository(get_env().db_path)
+    return _repo_singleton

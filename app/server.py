@@ -35,7 +35,81 @@ BASE_DIR = Path(__file__).parent.parent
 env = get_env()
 store = get_store()
 
-app = FastAPI(title="Whisper Transcriber", version=__version__)
+TAGS_METADATA = [
+    {
+        "name": "system",
+        "description": "Информация о запущенном инстансе и системных ресурсах: "
+                       "версия, аптайм, CPU, RAM, GPU, диски.",
+    },
+    {
+        "name": "jobs",
+        "description": "Управление задачами транскрибации: создание, мониторинг, "
+                       "отмена, удаление. Включает SSE-поток для live-обновлений.",
+    },
+    {
+        "name": "settings",
+        "description": "Runtime-настройки приложения. Значения по умолчанию "
+                       "читаются из .env, переопределения сохраняются в data/settings.json.",
+    },
+    {
+        "name": "i18n",
+        "description": "Локализация интерфейса: список доступных языков и "
+                       "переводы по ключам.",
+    },
+]
+
+DESCRIPTION = """
+**Whisper Transcriber** — веб-приложение для транскрибации аудио и видео
+с использованием локальных моделей Whisper (faster-whisper + CTranslate2).
+
+### Возможности
+
+* 🎙️ **Локальная транскрибация** — модель работает на вашей GPU/CPU, данные не уходят в облако
+* 🚀 **GPU-ускорение** — CUDA + float16, поддержка RTX 40xx/50xx
+* 📊 **Live-прогресс** — SSE-стрим событий: логи, прогресс, сегменты в реальном времени
+* 🌍 **Мультиязычность** — русский, английский, немецкий, французский и др.
+* ⚙️ **Runtime-настройки** — смена модели, языка, batch_size без перезапуска сервера
+* 🧹 **Автоочистка** — старые задачи и файлы удаляются по расписанию
+* 📁 **Экспорт** — TXT, SRT (субтитры), JSON (структурированные данные)
+
+### Быстрый старт
+
+1. Создайте задачу через `POST /api/jobs` с файлом
+2. Подпишитесь на события через `GET /api/jobs/{job_id}/stream`
+3. Получите результат через `GET /api/jobs/{job_id}/result`
+
+### Формат SSE-событий
+
+Каждое событие — JSON-объект с полем `type`:
+
+* `snapshot` — полный снимок состояния при подключении
+* `log` — запись лога (`entry: {time, level, message}`)
+* `progress` — обновление прогресса (`value`, `message`, `stage`)
+* `status` — смена статуса (`status`, `message`)
+* `segment` — новый распознанный сегмент (`segment: {start, end, text}`)
+* `done` — задача завершена (`text`, `metadata`)
+* `error` — ошибка (`message`)
+* `cancelled` — задача отменена
+"""
+
+app = FastAPI(
+    title="Whisper Transcriber API",
+    description=DESCRIPTION,
+    version=__version__,
+    openapi_tags=TAGS_METADATA,
+    contact={
+        "name": "Whisper Transcriber",
+        "url": "https://github.com/mbiuib/AITranscriber",
+    },
+    license_info={
+        "name": "MIT",
+        "url": "https://opensource.org/licenses/MIT",
+    },
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=env.cors_origins_list,
@@ -92,7 +166,12 @@ async def _startup() -> None:
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
-@app.get("/api/system")
+@app.get(
+    "/api/system",
+    tags=["system"],
+    summary="Информация о приложении",
+    description="Возвращает версию, аптайм и пути к рабочим папкам.",
+)
 async def system_info() -> Dict[str, Any]:
     """
     Возвращает базовую информацию о запущенном инстансе.
@@ -111,7 +190,13 @@ async def system_info() -> Dict[str, Any]:
     }
 
 
-@app.get("/api/system/resources")
+@app.get(
+    "/api/system/resources",
+    tags=["system"],
+    summary="Снимок ресурсов системы",
+    description="CPU, RAM, GPU (если доступна), диски и скользящая история "
+                "последних 60 замеров для отображения графиков.",
+)
 async def system_resources() -> Dict[str, Any]:
     """
     Возвращает текущий снимок ресурсов системы.
@@ -125,7 +210,7 @@ async def system_resources() -> Dict[str, Any]:
     return monitor.snapshot(env.models_dir, env.upload_dir)
 
 
-@app.get("/api/settings/schema")
+@app.get("/api/settings/schema", tags=["settings"], summary="Схема runtime-настроек")
 async def settings_schema() -> Dict[str, Any]:
     """
     Возвращает схему runtime-настроек.
@@ -140,7 +225,7 @@ async def settings_schema() -> Dict[str, Any]:
     return {"schema": RUNTIME_SCHEMA}
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", tags=["settings"], summary="Текущие значения настроек")
 async def get_settings() -> Dict[str, Any]:
     """
     Возвращает текущие значения всех runtime-настроек.
@@ -154,7 +239,7 @@ async def get_settings() -> Dict[str, Any]:
     return {"values": store.all()}
 
 
-@app.put("/api/settings")
+@app.put("/api/settings", tags=["settings"], summary="Обновить настройки")
 async def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Обновляет одну или несколько runtime-настроек.
@@ -204,7 +289,7 @@ async def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "values": store.all()}
 
 
-@app.post("/api/settings/reset")
+@app.post("/api/settings/reset", tags=["settings"], summary="Сбросить настройки к значениям из .env")
 async def reset_settings(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Сбрасывает настройки к значениям по умолчанию из .env.
@@ -222,7 +307,7 @@ async def reset_settings(payload: Optional[Dict[str, Any]] = None) -> Dict[str, 
     return {"ok": True, "values": store.all()}
 
 
-@app.get("/api/locales")
+@app.get("/api/locales", tags=["i18n"], summary="Список доступных локалей")
 async def locales_list() -> Dict[str, Any]:
     """
     Возвращает список доступных локалей и текущий выбранный язык.
@@ -239,7 +324,7 @@ async def locales_list() -> Dict[str, Any]:
     }
 
 
-@app.get("/api/locales/{lang}")
+@app.get("/api/locales/{lang}", tags=["i18n"], summary="Переводы для указанного языка")
 async def locale_get(lang: str) -> Dict[str, str]:
     """
     Возвращает перевод интерфейса для указанного языка.
@@ -259,7 +344,7 @@ async def locale_get(lang: str) -> Dict[str, str]:
     return data
 
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", tags=["jobs"], summary="Список всех задач")
 async def list_jobs() -> Dict[str, Any]:
     """
     Возвращает краткий список всех задач.
@@ -274,7 +359,26 @@ async def list_jobs() -> Dict[str, Any]:
     return {"jobs": [j.summary() for j in job_manager.list()]}
 
 
-@app.post("/api/jobs")
+@app.post(
+    "/api/jobs",
+    tags=["jobs"],
+    summary="Создать задачу транскрибации",
+    description="Принимает файл (multipart/form-data) и параметры обработки. "
+                "Возвращает ID задачи сразу; воркер запускается в фоне. "
+                "Следите за прогрессом через `/api/jobs/{id}/stream`.",
+    responses={
+        200: {
+            "description": "Задача создана",
+            "content": {
+                "application/json": {
+                    "example": {"job_id": "a1b2c3d4e5f6", "status": "pending"}
+                }
+            },
+        },
+        400: {"description": "Неподдерживаемый формат файла"},
+        413: {"description": "Файл превышает лимит из настроек"},
+    },
+)
 async def create_job(
     file: UploadFile = File(...),
     model: Optional[str] = Form(None),
@@ -352,7 +456,7 @@ async def create_job(
     return {"job_id": job.id, "status": "pending"}
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", tags=["jobs"], summary="Полный снимок задачи")
 async def get_job(job_id: str) -> Dict[str, Any]:
     """
     Возвращает полный снимок состояния задачи.
@@ -376,7 +480,7 @@ async def get_job(job_id: str) -> Dict[str, Any]:
     return job.snapshot()
 
 
-@app.post("/api/jobs/{job_id}/cancel")
+@app.post("/api/jobs/{job_id}/cancel", tags=["jobs"], summary="Отменить задачу")
 async def cancel_job(job_id: str) -> Dict[str, bool]:
     """
     Запрашивает отмену задачи.
@@ -402,7 +506,7 @@ async def cancel_job(job_id: str) -> Dict[str, bool]:
     return {"ok": True}
 
 
-@app.delete("/api/jobs/{job_id}")
+@app.delete("/api/jobs/{job_id}", tags=["jobs"], summary="Удалить задачу")
 async def delete_job(job_id: str) -> Dict[str, bool]:
     """
     Удаляет задачу вместе с её файлом.
@@ -443,7 +547,15 @@ def _sse(event: Dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-@app.get("/api/jobs/{job_id}/stream")
+@app.get(
+    "/api/jobs/{job_id}/stream",
+    tags=["jobs"],
+    summary="SSE-поток событий задачи",
+    description="Первым сообщением всегда идёт `snapshot` с полным состоянием. "
+                "Затем — live-события: `log`, `progress`, `status`, `segment`. "
+                "Поток закрывается после `done`, `error` или `cancelled`.",
+    response_class=StreamingResponse,
+)
 async def stream_job(job_id: str) -> StreamingResponse:
     """
     Открывает SSE-поток событий по задаче.
@@ -502,7 +614,7 @@ async def stream_job(job_id: str) -> StreamingResponse:
     )
 
 
-@app.get("/api/jobs/{job_id}/result")
+@app.get("/api/jobs/{job_id}/result", tags=["jobs"], summary="Финальный результат задачи")
 async def get_result(job_id: str) -> Dict[str, Any]:
     """
     Возвращает финальный результат задачи в структурированном виде.

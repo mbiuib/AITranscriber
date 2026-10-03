@@ -934,13 +934,33 @@ async function refreshHistory() {
     const r = await fetch(url);
     const d = await r.json();
     state.jobs = d.jobs;
+    state.queue = {
+      size: d.queue_size || 0,
+      running: d.queue_running || 0,
+      max: d.queue_max_parallel || 1,
+    };
     renderHistory();
+    updateQueueIndicator();
 
     const badge = $("#nav-badge-history");
     const active = d.active_count || 0;
     badge.hidden = active === 0;
     badge.textContent = active;
   } catch {}
+}
+
+function updateQueueIndicator() {
+  const el = $("#queue-indicator");
+  if (!el) return;
+  const q = state.queue || { size: 0, running: 0, max: 1 };
+  if (q.size === 0 && q.running === 0) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.querySelector(".queue-running").textContent = q.running;
+  el.querySelector(".queue-size").textContent = q.size;
+  el.querySelector(".queue-max").textContent = q.max;
 }
 
 function renderHistory() {
@@ -966,6 +986,16 @@ function renderHistory() {
           `<span class="history-tag">${escapeHtml(tag)}</span>`).join("")}</div>`
       : "";
 
+    let statusHtml;
+    if (j.status === "queued" && j.queue_position) {
+      statusHtml = `<div class="history-status queued">
+        <span class="material-symbols-rounded">schedule</span>
+        #${j.queue_position}
+      </div>`;
+    } else {
+      statusHtml = `<div class="history-status ${j.status}">${t("stage." + j.status) || j.status}</div>`;
+    }
+
     item.innerHTML = `
       <button class="history-star ${j.starred ? "starred" : ""}" title="В избранное">
         <span class="material-symbols-rounded">star</span>
@@ -978,7 +1008,7 @@ function renderHistory() {
         <div class="history-meta">${created} · ${j.model} · ${dur} · ${j.segments_count} сегм.</div>
         ${tagsHtml}
       </div>
-      <div class="history-status ${j.status}">${t("stage." + j.status) || j.status}</div>
+      ${statusHtml}
       <button class="btn-icon" data-action="delete" title="Удалить">
         <span class="material-symbols-rounded">delete</span>
       </button>

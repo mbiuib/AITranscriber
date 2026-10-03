@@ -385,10 +385,8 @@ class JobRepository:
         """
         Помечает все незавершённые задачи как прерванные.
 
-        Вызывается при старте сервера: если в БД есть задача со статусом
-        pending/downloading/loading/transcribing, значит процесс упал или
-        был перезапущен до её завершения. Возобновить её нельзя — но
-        пользователь должен видеть, что произошло.
+        Учитывает статус queued — задачи, стоявшие в очереди на момент
+        остановки сервера, не могут быть возобновлены.
 
         Returns:
             Количество помеченных задач.
@@ -399,7 +397,7 @@ class JobRepository:
                 UPDATE jobs
                 SET status = 'interrupted',
                     error = 'Прервано перезапуском сервера'
-                WHERE status IN ('pending', 'downloading', 'loading', 'transcribing')
+                WHERE status IN ('queued', 'pending', 'downloading', 'loading', 'transcribing')
             """)
             affected = cur.rowcount
             cur.close()
@@ -668,16 +666,16 @@ class JobRepository:
 
     def count_active(self) -> int:
         """
-        Считает активные задачи (в обработке).
+        Считает активные задачи (в очереди или в обработке).
 
         Returns:
-            Количество задач со статусом pending/downloading/loading/transcribing.
+            Количество задач с активным статусом.
         """
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("""
                 SELECT COUNT(*) AS cnt FROM jobs
-                WHERE status IN ('pending', 'downloading', 'loading', 'transcribing')
+                WHERE status IN ('queued', 'pending', 'downloading', 'loading', 'transcribing')
             """)
             cnt = cur.fetchone()["cnt"]
             cur.close()

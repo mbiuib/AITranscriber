@@ -68,6 +68,11 @@ RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
         "type": "int", "min": 1, "max": 102400,
         "label": "Максимальный размер файла (МБ)", "group": "server", "order": 1,
     },
+    "server.max_parallel_jobs": {
+        "type": "int", "min": 1, "max": 16,
+        "label": "Одновременных задач", "group": "server", "order": 0,
+        "hint": "1 — строго по одной (FIFO), 2+ — параллельная обработка",
+    },
     "server.retention_hours": {
         "type": "int", "min": 1, "max": 8760,
         "label": "Хранить результаты (часов)", "group": "server", "order": 2,
@@ -162,6 +167,7 @@ class EnvSettings(BaseSettings):
     default_hotwords: str = ""
 
     max_upload_mb: int = 4096
+    max_parallel_jobs: int = 1
     max_workers: int = 4
     retention_hours: int = 24
     cleanup_interval_min: int = 30
@@ -311,6 +317,7 @@ class SettingsStore:
             "transcription.initial_prompt": env.default_initial_prompt,
             "transcription.hotwords": env.default_hotwords,
             "server.max_upload_mb": env.max_upload_mb,
+            "server.max_parallel_jobs": env.max_parallel_jobs,
             "server.retention_hours": env.retention_hours,
             "server.cleanup_interval_min": env.cleanup_interval_min,
             "ui.language": env.default_ui_language,

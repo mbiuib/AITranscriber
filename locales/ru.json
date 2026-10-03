@@ -50,6 +50,7 @@
   "stage.error": "Ошибка",
   "stage.cancelled": "Отменено",
   "stage.interrupted": "Прервано",
+  "stage.queued": "В очереди",
 
   "result.title": "Результат",
   "result.empty": "Здесь появится распознанный текст",

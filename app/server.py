@@ -32,6 +32,7 @@ from .i18n import available as locales_available, load as load_locale
 from .config import get_repository
 from .jobs import init_job_manager, get_job_manager
 from . import monitor, transcribe
+from .queue import init_task_queue, get_task_queue
 
 BASE_DIR = Path(__file__).parent.parent
 env = get_env()
@@ -142,8 +143,11 @@ def _cleanup_loop() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     """
-    Инициализирует репозиторий, помечает прерванные задачи и запускает
-    фоновую очистку.
+    Инициализирует репозиторий, очередь задач и фоновую очистку.
+
+    Порядок важен: сначала помечаем прерванные задачи, потом создаём
+    JobManager, потом инициализируем очередь — она вызывает
+    get_job_manager() при первом же воркере.
     """
     env.upload_dir.mkdir(parents=True, exist_ok=True)
     env.models_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +158,16 @@ async def _startup() -> None:
         print(f"[startup] Помечено прерванных задач: {interrupted}")
 
     init_job_manager(repo=repo)
+
+    jm = get_job_manager()
+    max_parallel = int(store.get("server.max_parallel_jobs"))
+    init_task_queue(
+        get_job=lambda jid: jm.get(jid),
+        run_job=transcribe.run,
+        max_parallel=max_parallel,
+    )
+    print(f"[startup] Очередь задач: параллелизм = {max_parallel}")
+
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
@@ -277,6 +291,13 @@ async def update_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         except (ValueError, TypeError) as e:
             raise HTTPException(400, f"Некорректное значение {key}: {e}")
     store.set_many(clean)
+    if "server.max_parallel_jobs" in clean:
+        try:
+            actual = get_task_queue().set_max_parallel(int(clean["server.max_parallel_jobs"]))
+            print(f"[settings] Параллелизм изменён на {actual}")
+        except RuntimeError:
+            pass
+
     return {"ok": True, "values": store.all()}
 
 
@@ -349,39 +370,44 @@ async def list_jobs(
     """
     Возвращает краткий список задач с фильтрацией.
 
-    Все параметры опциональны и комбинируются через AND. Поиск q проверяет
-    имя файла, текст, заметки и теги. Список отсортирован от новых к старым.
-
-    Args:
-        q: Подстрока для поиска.
-        status: Фильтр по статусу (done, error, cancelled, interrupted, ...).
-        favorite: True — только избранные, False — только не-избранные.
-        tag: Фильтр по наличию тега.
-        date_from: Минимальная дата создания в Unix-времени.
-        date_to: Максимальная дата создания.
-        limit: Максимум записей (1–1000).
-        offset: Смещение для пагинации.
+    Для задач в статусе queued добавляется поле queue_position —
+    порядковый номер в очереди (1-based).
 
     Returns:
-        Словарь {"jobs": [...], "offset": M, "limit": L, "active_count": N}.
-        active_count — общее число активных задач, не зависит от фильтров.
+        Словарь с полями jobs, offset, limit, active_count,
+        queue_size, queue_running, queue_max_parallel.
     """
     repo = get_repository()
     jobs = repo.list_summaries(
-        limit=limit,
-        offset=offset,
-        query=q,
-        status=status,
-        favorite=favorite,
-        tag=tag,
-        date_from=date_from,
-        date_to=date_to,
+        limit=limit, offset=offset,
+        query=q, status=status, favorite=favorite, tag=tag,
+        date_from=date_from, date_to=date_to,
     )
+
+    try:
+        tq = get_task_queue()
+        positions = tq.positions()
+        for j in jobs:
+            if j["status"] == "queued":
+                pos = positions.get(j["id"])
+                if pos is not None:
+                    j["queue_position"] = pos
+        queue_size = tq.size()
+        queue_running = tq.running_count()
+        queue_max = tq.get_max_parallel()
+    except RuntimeError:
+        queue_size = 0
+        queue_running = 0
+        queue_max = 1
+
     return {
         "jobs": jobs,
         "offset": offset,
         "limit": limit,
         "active_count": repo.count_active(),
+        "queue_size": queue_size,
+        "queue_running": queue_running,
+        "queue_max_parallel": queue_max,
     }
 
 
@@ -499,11 +525,11 @@ async def create_job(
                 },
             )
 
+    job.set_status("queued", "В очереди")
     job.log("info", f"Задача {job.id} создана: {file.filename} ({size / 1024 / 1024:.1f} МБ)")
+    get_task_queue().put(job.id)
 
-    threading.Thread(target=transcribe.run, args=(job,), daemon=True).start()
-
-    return {"job_id": job.id, "status": "pending"}
+    return {"job_id": job.id, "status": "queued"}
 
 
 @app.patch(
@@ -647,21 +673,78 @@ async def get_job(job_id: str) -> Dict[str, Any]:
 
 @app.post("/api/jobs/{job_id}/cancel", tags=["jobs"], summary="Отменить задачу")
 async def cancel_job(job_id: str) -> Dict[str, bool]:
-    """Запрашивает отмену задачи."""
-    job = get_job_manager().get(job_id)
+    """
+    Запрашивает отмену задачи.
+
+    Если задача ещё в очереди — она немедленно удаляется из неё и
+    получает статус cancelled. Если выполняется — устанавливается флаг,
+    и воркер прервёт её при первой возможности.
+
+    Args:
+        job_id: Идентификатор задачи.
+
+    Returns:
+        {"ok": True}.
+
+    Raises:
+        HTTPException: 404, если задача не найдена;
+            409, если задача уже завершена.
+    """
+    jm = get_job_manager()
+    job = jm.get(job_id)
     if not job:
-        raise HTTPException(404, "Задача не найдена")
+        snap = jm.get_snapshot(job_id)
+        if not snap:
+            raise HTTPException(404, "Задача не найдена")
+        raise HTTPException(409, f"Задача уже завершена ({snap['status']})")
+
     job.cancel()
+    get_task_queue().remove(job_id)
     return {"ok": True}
 
 
 @app.delete("/api/jobs/{job_id}", tags=["jobs"], summary="Удалить задачу")
 async def delete_job(job_id: str) -> Dict[str, bool]:
-    """Удаляет задачу вместе с её файлом."""
+    """
+    Удаляет задачу вместе с её файлом.
+
+    Сначала вынимает из очереди, если задача там, потом удаляет из БД.
+
+    Args:
+        job_id: Идентификатор задачи.
+
+    Returns:
+        {"ok": True}.
+
+    Raises:
+        HTTPException: 404, если задача не найдена.
+    """
+    get_task_queue().remove(job_id)
     ok = get_job_manager().delete(job_id, remove_file=True)
     if not ok:
         raise HTTPException(404, "Задача не найдена")
     return {"ok": True}
+
+
+@app.get("/api/queue", tags=["jobs"], summary="Состояние очереди")
+async def queue_status() -> Dict[str, Any]:
+    """
+    Возвращает текущее состояние очереди задач.
+
+    Returns:
+        Словарь с полями size (задач ждёт), running (выполняется),
+        max_parallel (лимит) и positions (job_id → позиция).
+    """
+    try:
+        tq = get_task_queue()
+    except RuntimeError:
+        return {"size": 0, "running": 0, "max_parallel": 1, "positions": {}}
+    return {
+        "size": tq.size(),
+        "running": tq.running_count(),
+        "max_parallel": tq.get_max_parallel(),
+        "positions": tq.positions(),
+    }
 
 
 def _sse(event: Dict) -> str:

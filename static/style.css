@@ -2174,3 +2174,37 @@ textarea::-webkit-scrollbar-corner {
   color: var(--text-1);
   font-weight: 600;
 }
+
+/* ============================================================
+   Queue indicator
+   ============================================================ */
+.queue-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  background: var(--bg-2);
+  border-radius: var(--radius);
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.queue-indicator .material-symbols-rounded {
+  font-size: 16px;
+  color: var(--accent);
+}
+.queue-text {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.history-status.queued {
+  background: color-mix(in srgb, var(--info) 18%, transparent);
+  color: var(--info);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.history-status.queued .material-symbols-rounded { font-size: 12px; }

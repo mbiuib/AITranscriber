@@ -50,6 +50,7 @@
   "stage.error": "Error",
   "stage.cancelled": "Cancelled",
   "stage.interrupted": "Interrupted",
+  "stage.queued": "Queued",
 
   "result.title": "Result",
   "result.empty": "Transcribed text will appear here",

@@ -8,6 +8,7 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 // ============================================================
 // State
 // ============================================================
+const ACTIVE_JOB_KEY = "whisper_active_job_id";
 const state = {
   file: null,
   jobId: null,
@@ -353,6 +354,7 @@ function setFile(file) {
   $("#chip-name").textContent = file.name;
   $("#chip-size").textContent = formatSize(file.size);
   $("#file-chip").hidden = false;
+  $("#chip-remove").style.display = "";
   $("#dropzone").classList.add("has-file");
   $(".dropzone-title").textContent = t("upload.file_ready");
   $(".dropzone-hint").textContent = t("upload.change");
@@ -363,6 +365,7 @@ function clearFile() {
   state.file = null;
   $("#file-input").value = "";
   $("#file-chip").hidden = true;
+  $("#chip-remove").style.display = "";
   $("#dropzone").classList.remove("has-file");
   $(".dropzone-title").textContent = t("upload.drop");
   $(".dropzone-hint").textContent = t("upload.hint");
@@ -396,6 +399,7 @@ async function start() {
     const d = await r.json();
     state.jobId = d.job_id;
     toast("success", "✅", t("toast.job_created"));
+    saveActiveJob(d.job_id);
     subscribe(d.job_id);
     refreshHistory();
   } catch (e) {
@@ -423,6 +427,85 @@ function subscribe(jobId) {
   es.onerror = () => { if (!state.running) es.close(); };
 }
 
+function saveActiveJob(jobId) {
+  try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch {}
+}
+
+function clearActiveJob() {
+  try { localStorage.removeItem(ACTIVE_JOB_KEY); } catch {}
+}
+
+function getSavedJobId() {
+  try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; }
+}
+
+async function restoreActiveJob() {
+  let jobId = getSavedJobId();
+
+  if (!jobId) {
+    try {
+      const r = await fetch("/api/jobs");
+      const d = await r.json();
+      const active = (d.jobs || []).find(j =>
+        ["pending", "downloading", "loading", "transcribing"].includes(j.status)
+      );
+      if (active) jobId = active.id;
+    } catch {}
+  }
+
+  if (!jobId) return;
+
+  let snap;
+  try {
+    const r = await fetch(`/api/jobs/${jobId}`);
+    if (r.status === 404) {
+      clearActiveJob();
+      return;
+    }
+    if (!r.ok) return;
+    snap = await r.json();
+  } catch {
+    return;
+  }
+
+  applySnapshot(snap);
+  saveActiveJob(snap.id);
+  state.jobId = snap.id;
+
+  const isActive = ["pending", "downloading", "loading", "transcribing"]
+    .includes(snap.status);
+
+  if (isActive) {
+    state.running = true;
+    $("#start-btn").disabled = true;
+    $("#cancel-btn").disabled = false;
+    ensureConsoleOpen();
+
+    $("#chip-name").textContent = snap.filename;
+    $("#chip-size").textContent = formatSize(snap.file_size || 0);
+    $("#file-chip").hidden = false;
+    $("#chip-remove").style.display = "none";
+
+    subscribe(snap.id);
+
+    toast("info", "🔄", "Восстановлено: задача выполняется");
+  } else {
+    $("#chip-name").textContent = snap.filename;
+    $("#chip-size").textContent = formatSize(snap.file_size || 0);
+    $("#file-chip").hidden = false;
+    $("#chip-remove").style.display = "none";
+
+    if (snap.status === "done") {
+      toast("success", "✅", "Восстановлен результат");
+    } else if (snap.status === "error") {
+      toast("error", "❌", "Задача завершилась с ошибкой");
+    } else if (snap.status === "cancelled") {
+      toast("warn", "⏹", "Задача была отменена");
+    }
+    clearActiveJob();
+  }
+}
+
 function handleEvent(ev) {
   switch (ev.type) {
     case "snapshot": applySnapshot(ev.data); break;
@@ -438,14 +521,25 @@ function handleEvent(ev) {
 
 function applySnapshot(snap) {
   for (const log of snap.logs || []) appendLog(log, true);
+
   if (snap.segments?.length) {
-    $("#result-content").innerHTML = '<div class="segments" id="segments"></div>';
     state.segments = [];
+    state.seenSegmentsCount = 0;
+    $("#result-content").innerHTML =
+      '<div class="segments" id="segments"></div>';
     for (const s of snap.segments) appendSegment(s, true);
+    state.seenSegmentsCount = state.segments.length;
+    updateScrollButton();
   }
-  if (snap.progress !== undefined) updateProgress(snap.progress, snap.message, snap.stage);
+
+  if (snap.progress !== undefined) {
+    updateProgress(snap.progress, snap.message, snap.stage);
+  }
   updateStatus(snap.status, snap.message);
-  if (snap.status === "done") onDone(snap.text, snap.metadata);
+
+  if (snap.status === "done") {
+    onDone(snap.text, snap.metadata);
+  }
 }
 
 function updateProgress(v, msg, stage) {
@@ -566,6 +660,7 @@ function onDone(text, metadata) {
   state.running = false;
   state.seenSegmentsCount = state.segments.length;
   updateScrollButton();
+  clearActiveJob();
 
   $("#start-btn").disabled = !state.file;
   $("#cancel-btn").disabled = true;
@@ -590,6 +685,7 @@ function onDone(text, metadata) {
 
 function onError(msg) {
   state.running = false;
+  clearActiveJob();
   $("#start-btn").disabled = !state.file;
   $("#cancel-btn").disabled = true;
   $("#progress-fill").classList.remove("active");
@@ -600,6 +696,7 @@ function onError(msg) {
 
 function onCancelled() {
   state.running = false;
+  clearActiveJob();
   $("#start-btn").disabled = !state.file;
   $("#cancel-btn").disabled = true;
   $("#progress-fill").classList.remove("active");
@@ -963,4 +1060,5 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(loadSystem, 5000);
   refreshHistory();
   setInterval(refreshHistory, 10000);
+  await restoreActiveJob();
 });

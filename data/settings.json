@@ -4,5 +4,6 @@
   "transcription.device": "cuda",
   "transcription.compute_type": "float16",
   "transcription.batch_size": 10,
-  "transcription.language": "auto"
+  "transcription.language": "auto",
+  "server.max_parallel_jobs": 2
 }

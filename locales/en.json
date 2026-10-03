@@ -52,6 +52,17 @@
   "stage.interrupted": "Interrupted",
   "stage.queued": "Queued",
 
+  "nav.dashboard": "Dashboard",
+  "dashboard.title": "Dashboard",
+  "dashboard.total": "Total jobs",
+  "dashboard.active": "Active",
+  "dashboard.audio": "Hours of audio",
+  "dashboard.rtf": "Average RTF",
+  "dashboard.starred": "Starred",
+  "dashboard.activity": "Activity (30 days)",
+  "dashboard.top_models": "Top models",
+  "dashboard.top_languages": "Top languages",
+
   "result.title": "Result",
   "result.empty": "Transcribed text will appear here",
   "result.empty_hint": "Upload a file and click «Start transcription»",

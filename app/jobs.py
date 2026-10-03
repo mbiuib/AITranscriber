@@ -449,6 +449,63 @@ class JobManager:
 
         return True
 
+    def delete_many(self, job_ids: List[str], remove_files: bool = True) -> Dict[str, Any]:
+        """
+        Удаляет несколько задач за одну операцию.
+
+        Сначала собирает пути к файлам (из памяти и БД), затем удаляет
+        записи из БД одним запросом, затем чистит файлы на диске.
+
+        Args:
+            job_ids: Список идентификаторов задач.
+            remove_files: Удалять ли связанные файлы.
+
+        Returns:
+            Словарь {"deleted": int, "not_found": [id, ...], "files_removed": int}.
+        """
+        if not job_ids:
+            return {"deleted": 0, "not_found": [], "files_removed": 0}
+
+        file_paths: Dict[str, str] = {}
+        with self._lock:
+            for jid in job_ids:
+                job = self._jobs.pop(jid, None)
+                if job:
+                    file_paths[jid] = job.file_path
+
+        not_found = []
+        if self._repo:
+            for jid in job_ids:
+                if jid in file_paths:
+                    continue
+                snap = self._repo.get_job(jid)
+                if snap:
+                    file_paths[jid] = snap.get("file_path", "")
+                else:
+                    not_found.append(jid)
+
+            deleted_ids = self._repo.delete_many(job_ids)
+        else:
+            deleted_ids = list(file_paths.keys())
+            not_found = [jid for jid in job_ids if jid not in file_paths]
+
+        files_removed = 0
+        if remove_files:
+            for jid in deleted_ids:
+                path = file_paths.get(jid)
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        files_removed += 1
+                    except OSError:
+                        pass
+
+        return {
+            "deleted": len(deleted_ids),
+            "not_found": not_found,
+            "files_removed": files_removed,
+        }
+
     def cleanup_expired(self, retention_hours: int) -> int:
         """
         Удаляет завершённые задачи старше указанного срока.

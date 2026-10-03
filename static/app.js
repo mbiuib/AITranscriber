@@ -32,6 +32,10 @@ const state = {
   detailJob: null,
   detailTags: [],
   historyFilter: { q: "", status: "", favorite: false },
+  files: [],
+  dashboardTimer: null,
+  selectionMode: false,
+  selectedJobs: new Set(),
 };
 
 /* ============================================================
@@ -120,25 +124,30 @@ function toast(kind, iconName, text, timeout = 3500) {
    System info / GPU
    ============================================================ */
 async function loadSystem() {
+  const info = $("#gpu-info");
+  if (!info) return;
+
   try {
     const r = await fetch("/api/system/resources");
     const d = await r.json();
-    const pill = $("#gpu-pill");
+
     if (d.gpu) {
-      pill.classList.add("ok");
-      pill.classList.remove("err");
-      pill.querySelector(".text").textContent =
-        `${d.gpu.name} · ${d.gpu.memory_used_gb}/${d.gpu.memory_total_gb} GB · ${d.gpu.utilization}%`;
+      const text = `${d.gpu.name} · ${d.gpu.memory_used_gb}/${d.gpu.memory_total_gb} GB · ${d.gpu.utilization}%`;
+      info.classList.add("ok");
+      info.classList.remove("err");
+      info.querySelector(".text").textContent = text;
+      info.title = text;
     } else {
-      pill.classList.remove("ok");
-      pill.classList.add("err");
-      pill.querySelector(".text").textContent = t("status.gpu_unavailable");
+      info.classList.remove("ok");
+      info.classList.add("err");
+      info.querySelector(".text").textContent = "GPU недоступна";
+      info.title = "CUDA не обнаружена или драйвер не отвечает";
     }
-  } catch {
-    const pill = $("#gpu-pill");
-    pill.classList.remove("ok");
-    pill.classList.add("err");
-    pill.querySelector(".text").textContent = t("status.disconnected");
+  } catch (e) {
+    info.classList.remove("ok");
+    info.classList.add("err");
+    info.querySelector(".text").textContent = "Сервер недоступен";
+    info.title = String(e);
   }
 }
 
@@ -474,7 +483,7 @@ async function restoreActiveJob() {
     $("#cancel-btn").disabled = false;
     ensureConsoleOpen();
     subscribe(snap.id);
-    toast("info", "refresh", "Восстановлено: задача выполняется");
+    toast("info", "refresh", `Восстановлено: ${snap.filename}`);
   } else {
     if (snap.status === "done") {
       toast("success", "check_circle", "Восстановлен результат");
@@ -493,8 +502,11 @@ async function restoreActiveJob() {
 function setupDropzone() {
   const dz = $("#dropzone");
   const input = $("#file-input");
+
   dz.addEventListener("click", () => input.click());
-  input.addEventListener("change", () => input.files[0] && setFile(input.files[0]));
+  input.addEventListener("change", () => {
+    if (input.files.length) addFiles([...input.files]);
+  });
 
   ["dragenter", "dragover"].forEach(ev => dz.addEventListener(ev, e => {
     e.preventDefault(); dz.classList.add("dragover");
@@ -503,35 +515,82 @@ function setupDropzone() {
     e.preventDefault(); dz.classList.remove("dragover");
   }));
   dz.addEventListener("drop", e => {
-    const f = e.dataTransfer.files[0];
-    if (f) setFile(f);
+    const fs = [...e.dataTransfer.files];
+    if (fs.length) addFiles(fs);
   });
-  $("#chip-remove").addEventListener("click", e => {
-    e.stopPropagation(); clearFile();
-  });
+
+  $("#file-list-clear").addEventListener("click", clearFiles);
 }
 
-function setFile(file) {
-  state.file = file;
-  $("#chip-name").textContent = file.name;
-  $("#chip-size").textContent = formatSize(file.size);
-  $("#file-chip").hidden = false;
-  $("#chip-remove").style.display = "";
-  $("#dropzone").classList.add("has-file");
-  $(".dropzone-title").textContent = t("upload.file_ready");
-  $(".dropzone-hint").textContent = t("upload.change");
-  $("#start-btn").disabled = false;
+function addFiles(newFiles) {
+  for (const f of newFiles) {
+    if (!state.files.some(x => x.name === f.name && x.size === f.size)) {
+      state.files.push(f);
+    }
+  }
+  renderFileList();
 }
 
-function clearFile() {
-  state.file = null;
+function removeFile(index) {
+  state.files.splice(index, 1);
+  renderFileList();
+}
+
+function clearFiles() {
+  state.files = [];
   $("#file-input").value = "";
-  $("#file-chip").hidden = true;
-  $("#chip-remove").style.display = "";
-  $("#dropzone").classList.remove("has-file");
-  $(".dropzone-title").textContent = t("upload.drop");
-  $(".dropzone-hint").textContent = t("upload.hint");
-  $("#start-btn").disabled = true;
+  renderFileList();
+}
+
+function renderFileList() {
+  const list = $("#file-list");
+  const items = $("#file-list-items");
+  const count = $("#file-list-count");
+
+  if (!state.files.length) {
+    list.hidden = true;
+    $("#dropzone").classList.remove("has-file");
+    $(".dropzone-title").textContent = "Перетащите файлы сюда";
+    $(".dropzone-hint").textContent = "или нажмите для выбора · можно несколько сразу";
+    $("#start-btn").disabled = true;
+    return;
+  }
+
+  list.hidden = false;
+  $("#dropzone").classList.add("has-file");
+  $(".dropzone-title").textContent = `${state.files.length} ${filesLabel(state.files.length)} готово`;
+  $(".dropzone-hint").textContent = "Нажмите, чтобы добавить ещё";
+  $("#start-btn").disabled = false;
+
+  count.textContent = `${state.files.length} ${filesLabel(state.files.length)}`;
+  items.innerHTML = "";
+
+  state.files.forEach((f, i) => {
+    const el = document.createElement("div");
+    el.className = "file-list-item";
+    el.innerHTML = `
+      <span class="material-symbols-rounded">draft</span>
+      <span class="name"></span>
+      <span class="size">${formatSize(f.size)}</span>
+      <button class="remove" title="Убрать">
+        <span class="material-symbols-rounded">close</span>
+      </button>
+    `;
+    el.querySelector(".name").textContent = f.name;
+    el.querySelector(".remove").addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeFile(i);
+    });
+    items.appendChild(el);
+  });
+}
+
+function filesLabel(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "файл";
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return "файла";
+  return "файлов";
 }
 
 function formatSize(bytes) {
@@ -545,7 +604,7 @@ function formatSize(bytes) {
    Start / cancel
    ============================================================ */
 async function start(forceReprocess = false) {
-  if (!state.file || state.running) return;
+  if (!state.files.length || state.running) return;
   resetResult();
 
   state.running = true;
@@ -554,48 +613,77 @@ async function start(forceReprocess = false) {
   ensureConsoleOpen();
 
   const fd = new FormData();
-  fd.append("file", state.file);
+  for (const f of state.files) {
+    fd.append("files", f);
+  }
   fd.append("model", state.quickRefs.modelSel.value);
   fd.append("language", state.quickRefs.langSel.value);
   if (forceReprocess) fd.append("check_duplicate", "false");
 
   try {
-    const r = await fetch("/api/jobs", { method: "POST", body: fd });
-
-    if (r.status === 409) {
-      const d = await r.json();
-      const dup = d.detail?.duplicate_of;
-
-      state.running = false;
-      $("#start-btn").disabled = !state.file;
-      $("#cancel-btn").disabled = true;
-      resetResult();
-
-      if (dup) {
-        const choice = await showDuplicateModal(dup);
-
-        if (choice === "open") {
-          openJobDetail(dup.id);
-        } else if (choice === "reprocess") {
-          await start(true);
-        }
-      }
-      return;
-    }
+    const r = await fetch("/api/jobs/batch", { method: "POST", body: fd });
 
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
-    const d = await r.json();
-    state.jobId = d.job_id;
-    saveActiveJob(d.job_id);
-    toast("success", "check_circle", t("toast.job_created"));
-    subscribe(d.job_id);
+    const data = await r.json();
+
+    const created = data.results.filter(x => x.status === "created");
+    const duplicates = data.results.filter(x => x.status === "duplicate");
+    const errors = data.results.filter(x => x.status === "error");
+
+    if (created.length) {
+      const first = created[0];
+      state.jobId = first.job_id;
+      saveActiveJob(first.job_id);
+      subscribe(first.job_id);
+      toast("success", "check_circle",
+        `Создано задач: ${created.length}`);
+    }
+
+    if (duplicates.length) {
+      const dup = duplicates[0].duplicate_of;
+      const choice = await showDuplicateModal(dup);
+      if (choice === "open") {
+        openJobDetail(dup.id);
+      } else if (choice === "reprocess") {
+        // Обрабатываем повторно только дубликаты
+        await reprocessDuplicates(duplicates);
+      }
+    }
+
+    if (errors.length) {
+      toast("error", "error", `Ошибок: ${errors.length}. Первая: ${errors[0].message}`);
+    }
+
+    clearFiles();
     refreshHistory();
+    updateMiniDash();
   } catch (e) {
     toast("error", "error", e.message);
+  } finally {
     state.running = false;
-    $("#start-btn").disabled = false;
+    $("#start-btn").disabled = !state.files.length;
     $("#cancel-btn").disabled = true;
   }
+}
+
+async function reprocessDuplicates(duplicates) {
+  // Отправляем по одной без проверки дубликатов
+  for (const item of duplicates) {
+    if (state.running) return;
+    try {
+      const f = state.files.find(x => x.name === item.filename);
+      if (!f) continue;
+
+      const fd = new FormData();
+      fd.append("file", f);
+      fd.append("model", state.quickRefs.modelSel.value);
+      fd.append("language", state.quickRefs.langSel.value);
+      fd.append("check_duplicate", "false");
+
+      await fetch("/api/jobs", { method: "POST", body: fd });
+    } catch {}
+  }
+  refreshHistory();
 }
 
 async function cancelJob() {
@@ -934,19 +1022,206 @@ async function refreshHistory() {
     const r = await fetch(url);
     const d = await r.json();
     state.jobs = d.jobs;
+
+    // Чистим выделение от исчезнувших задач
+    const existingIds = new Set(state.jobs.map(j => j.id));
+    for (const id of state.selectedJobs) {
+      if (!existingIds.has(id)) state.selectedJobs.delete(id);
+    }
+
     state.queue = {
       size: d.queue_size || 0,
       running: d.queue_running || 0,
       max: d.queue_max_parallel || 1,
     };
     renderHistory();
-    updateQueueIndicator();
+    updateMiniDash();
 
     const badge = $("#nav-badge-history");
     const active = d.active_count || 0;
     badge.hidden = active === 0;
     badge.textContent = active;
   } catch {}
+}
+
+function updateMiniDash() {
+  const q = state.queue || { size: 0, running: 0, max: 1 };
+  $("#mini-running").textContent = q.running;
+  $("#mini-queued").textContent = q.size;
+  $("#mini-max").textContent = q.max;
+
+  const total = q.running + q.size;
+  const pct = q.max > 0 ? Math.min(100, Math.round((q.running / q.max) * 100)) : 0;
+  $("#mini-fill").style.width = pct + "%";
+}
+
+async function loadDashboard() {
+  try {
+    const r = await fetch("/api/dashboard");
+    const d = await r.json();
+
+    renderDashKpi(d);
+    renderDashChart(d.by_day || []);
+    renderDashTopModels(d.top_models || []);
+    renderDashTopLanguages(d.top_languages || []);
+
+    $("#dashboard-updated").textContent =
+      "Обновлено " + new Date().toLocaleTimeString("ru-RU", { hour12: false });
+  } catch (e) {
+    toast("error", "error", "Не удалось загрузить дашборд");
+  }
+}
+
+function renderDashKpi(d) {
+  const el = $("#dash-kpi-grid");
+  const status = d.by_status || {};
+  const total = d.total || 0;
+  const done = status.done || 0;
+  const error = status.error || 0;
+  const active = (status.queued || 0) + (status.pending || 0)
+    + (status.downloading || 0) + (status.loading || 0)
+    + (status.transcribing || 0);
+  const starred = d.starred_count || 0;
+
+  const audioH = ((d.total_audio_seconds || 0) / 3600).toFixed(1);
+  const procH = ((d.total_processing_seconds || 0) / 60).toFixed(1);
+  const rtf = d.avg_rtf != null ? `RTF ${d.avg_rtf}` : "—";
+
+  el.innerHTML = `
+    ${kpiCard("library_books", "Всего задач", total, `${done} завершено · ${error} ошибок`)}
+    ${kpiCard("schedule", "Активные", active, `В очереди и обработке`, active > 0 ? "accent" : "")}
+    ${kpiCard("graphic_eq", "Часов аудио", audioH, `${procH} мин обработки`)}
+    ${kpiCard("bolt", "Средний RTF", rtf, "Real-time factor")}
+    ${kpiCard("star", "Избранных", starred, "", "warn")}
+  `;
+}
+
+function kpiCard(icon, label, value, sub, variant = "") {
+  const iconCls = variant === "warn" ? "warn" : variant === "accent" ? "" : "success";
+  return `
+    <div class="dash-kpi">
+      <div class="dash-kpi-top">
+        <div class="dash-kpi-icon ${iconCls}">
+          <span class="material-symbols-rounded">${icon}</span>
+        </div>
+      </div>
+      <div class="dash-kpi-value">${value}</div>
+      <div class="dash-kpi-label">${label}</div>
+      ${sub ? `<div class="dash-kpi-sub">${sub}</div>` : ""}
+    </div>
+  `;
+}
+
+function renderDashChart(byDay) {
+  const el = $("#dash-chart");
+  if (!byDay.length) {
+    el.innerHTML = '<div class="dash-chart-empty">Нет данных за последние 30 дней</div>';
+    return;
+  }
+
+  const maxVal = Math.max(...byDay.map(d => d.count), 1);
+  const w = 800;
+  const h = 180;
+  const padL = 30;
+  const padR = 10;
+  const padT = 10;
+  const padB = 30;
+  const chartW = w - padL - padR;
+  const chartH = h - padT - padB;
+
+  const barW = Math.max(4, (chartW / byDay.length) - 4);
+  const step = chartW / byDay.length;
+
+  let bars = "";
+  let labels = "";
+  byDay.forEach((d, i) => {
+    const x = padL + i * step + (step - barW) / 2;
+    const totalH = (d.count / maxVal) * chartH;
+    const doneH = d.done > 0 ? (d.done / maxVal) * chartH : 0;
+    const errorH = d.error > 0 ? (d.error / maxVal) * chartH : 0;
+
+    const y = padT + chartH - totalH;
+    bars += `<rect x="${x}" y="${padT + chartH - doneH}" width="${barW}" height="${doneH}"
+             fill="var(--success)" opacity="0.85" rx="2"/>`;
+    if (errorH > 0) {
+      bars += `<rect x="${x}" y="${padT + chartH - doneH - errorH}"
+               width="${barW}" height="${errorH}"
+               fill="var(--error)" opacity="0.85" rx="2"/>`;
+    }
+
+    if (i % Math.ceil(byDay.length / 8) === 0 || i === byDay.length - 1) {
+      const date = new Date(d.date * 1000);
+      const label = `${date.getDate()}.${String(date.getMonth() + 1).padStart(2, "0")}`;
+      labels += `<text x="${x + barW / 2}" y="${h - 8}" text-anchor="middle"
+                 font-size="10" fill="var(--text-3)">${label}</text>`;
+    }
+  });
+
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (chartH / 4) * i;
+    const val = Math.round(maxVal - (maxVal / 4) * i);
+    grid += `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}"
+             stroke="var(--border)" stroke-dasharray="2 4"/>`;
+    grid += `<text x="${padL - 6}" y="${y + 3}" text-anchor="end"
+             font-size="9" fill="var(--text-3)">${val}</text>`;
+  }
+
+  el.innerHTML = `
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      ${grid}
+      ${bars}
+      ${labels}
+    </svg>
+  `;
+}
+
+function renderDashTopModels(models) {
+  const el = $("#dash-top-models");
+  if (!models.length) {
+    el.innerHTML = '<div class="dash-list-empty">Нет данных</div>';
+    return;
+  }
+  const max = Math.max(...models.map(m => m.count), 1);
+  el.innerHTML = models.map(m => `
+    <div class="dash-list-item">
+      <span class="material-symbols-rounded" style="font-size:16px;color:var(--accent)">memory</span>
+      <span class="dash-list-name">${escapeHtml(m.model)}</span>
+      <span class="dash-list-bar">
+        <span class="dash-list-bar-fill" style="width:${(m.count / max) * 100}%"></span>
+      </span>
+      <span class="dash-list-count">${m.count}</span>
+    </div>
+  `).join("");
+}
+
+function renderDashTopLanguages(langs) {
+  const el = $("#dash-top-languages");
+  if (!langs.length) {
+    el.innerHTML = '<div class="dash-list-empty">Нет данных</div>';
+    return;
+  }
+  const max = Math.max(...langs.map(l => l.count), 1);
+  el.innerHTML = langs.map(l => `
+    <div class="dash-list-item">
+      <span class="material-symbols-rounded" style="font-size:16px;color:var(--accent)">translate</span>
+      <span class="dash-list-name">${escapeHtml(l.language.toUpperCase())}</span>
+      <span class="dash-list-bar">
+        <span class="dash-list-bar-fill" style="width:${(l.count / max) * 100}%"></span>
+      </span>
+      <span class="dash-list-count">${l.count}</span>
+    </div>
+  `).join("");
+}
+
+function startDashboardMonitor() {
+  stopDashboardMonitor();
+  loadDashboard();
+  state.dashboardTimer = setInterval(loadDashboard, 5000);
+}
+function stopDashboardMonitor() {
+  if (state.dashboardTimer) clearInterval(state.dashboardTimer);
+  state.dashboardTimer = null;
 }
 
 function updateQueueIndicator() {
@@ -971,6 +1246,7 @@ function renderHistory() {
         <div class="empty-icon material-symbols-rounded">history_toggle_off</div>
         <div class="empty-text">${t("history.empty")}</div>
       </div>`;
+    updateBulkActions();
     return;
   }
   list.innerHTML = "";
@@ -978,6 +1254,7 @@ function renderHistory() {
     const item = document.createElement("div");
     item.className = "history-item";
     item.style.cursor = "pointer";
+    if (state.selectedJobs.has(j.id)) item.classList.add("selected");
 
     const created = new Date(j.created_at * 1000).toLocaleString("ru-RU");
     const dur = j.duration ? formatTs(j.duration) : "—";
@@ -996,7 +1273,14 @@ function renderHistory() {
       statusHtml = `<div class="history-status ${j.status}">${t("stage." + j.status) || j.status}</div>`;
     }
 
+    const checkboxHtml = state.selectionMode
+      ? `<button class="history-select ${state.selectedJobs.has(j.id) ? "checked" : ""}">
+           <span class="material-symbols-rounded">${state.selectedJobs.has(j.id) ? "check" : "radio_button_unchecked"}</span>
+         </button>`
+      : "";
+
     item.innerHTML = `
+      ${checkboxHtml}
       <button class="history-star ${j.starred ? "starred" : ""}" title="В избранное">
         <span class="material-symbols-rounded">star</span>
       </button>
@@ -1015,6 +1299,14 @@ function renderHistory() {
     `;
     item.querySelector(".history-name").textContent = j.filename;
 
+    const selectBtn = item.querySelector(".history-select");
+    if (selectBtn) {
+      selectBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleSelect(j.id);
+      });
+    }
+
     item.querySelector(".history-star").addEventListener("click", (e) => {
       e.stopPropagation();
       toggleStar(j.id, j.starred);
@@ -1023,11 +1315,22 @@ function renderHistory() {
     item.addEventListener("click", (e) => {
       if (e.target.closest('[data-action="delete"]')) return;
       if (e.target.closest(".history-star")) return;
-      openJobDetail(j.id);
+      if (e.target.closest(".history-select")) return;
+
+      if (state.selectionMode) {
+        toggleSelect(j.id);
+      } else {
+        openJobDetail(j.id);
+      }
     });
 
     item.querySelector('[data-action="delete"]').addEventListener("click", async (e) => {
       e.stopPropagation();
+
+      if (state.selectionMode) {
+        toggleSelect(j.id);
+        return;
+      }
 
       const confirmed = await showConfirm({
         title: "Удалить задачу?",
@@ -1045,6 +1348,138 @@ function renderHistory() {
 
     list.appendChild(item);
   }
+  updateBulkActions();
+}
+
+function toggleSelect(jobId) {
+  if (state.selectedJobs.has(jobId)) {
+    state.selectedJobs.delete(jobId);
+  } else {
+    state.selectedJobs.add(jobId);
+  }
+  renderHistory();
+}
+
+function toggleSelectionMode() {
+  state.selectionMode = !state.selectionMode;
+  state.selectedJobs.clear();
+
+  const btn = $("#history-select-toggle");
+  btn.classList.toggle("active", state.selectionMode);
+  btn.querySelector("span:last-child").textContent =
+    state.selectionMode ? "Готово" : "Выбрать";
+
+  renderHistory();
+}
+
+function updateBulkActions() {
+  const el = $("#bulk-actions");
+  if (!state.selectionMode) {
+    el.hidden = true;
+    return;
+  }
+
+  el.hidden = false;
+  const n = state.selectedJobs.size;
+  $("#bulk-count").textContent = n;
+}
+
+function selectAll() {
+  const allSelected = state.selectedJobs.size === state.jobs.length;
+  if (allSelected) {
+    state.selectedJobs.clear();
+  } else {
+    state.jobs.forEach(j => state.selectedJobs.add(j.id));
+  }
+  renderHistory();
+}
+
+async function bulkDelete() {
+  const ids = [...state.selectedJobs];
+  if (!ids.length) return;
+
+  const confirmed = await showConfirm({
+    title: `Удалить ${ids.length} ${jobsLabel(ids.length)}?`,
+    message: "Все выбранные задачи и их файлы будут удалены безвозвратно. " +
+             "Это действие нельзя отменить.",
+    confirmText: "Удалить всё",
+    icon: "delete_sweep",
+    danger: true,
+  });
+  if (!confirmed) return;
+
+  try {
+    const r = await fetch("/api/jobs/batch/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    if (!r.ok) throw new Error("Ошибка удаления");
+    const d = await r.json();
+
+    toast("success", "delete",
+      `Удалено: ${d.deleted}${d.not_found.length ? `, не найдено: ${d.not_found.length}` : ""}`);
+
+    state.selectedJobs.clear();
+    state.selectionMode = false;
+    const btn = $("#history-select-toggle");
+    btn.classList.remove("active");
+    btn.querySelector("span:last-child").textContent = "Выбрать";
+
+    refreshHistory();
+  } catch (e) {
+    toast("error", "error", e.message);
+  }
+}
+
+async function bulkStar(value) {
+  const ids = [...state.selectedJobs];
+  if (!ids.length) return;
+
+  try {
+    await Promise.all(ids.map(id =>
+      fetch(`/api/jobs/${id}/star`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ starred: value }),
+      })
+    ));
+    toast("success", "star",
+      `${value ? "Добавлено в избранное" : "Убрано из избранного"}: ${ids.length}`);
+
+    state.selectedJobs.clear();
+    state.selectionMode = false;
+    const btn = $("#history-select-toggle");
+    btn.classList.remove("active");
+    btn.querySelector("span:last-child").textContent = "Выбрать";
+
+    refreshHistory();
+  } catch (e) {
+    toast("error", "error", "Ошибка сохранения");
+  }
+}
+
+function jobsLabel(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "задачу";
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return "задачи";
+  return "задач";
+}
+
+function setupBulkActions() {
+  $("#history-select-toggle").addEventListener("click", toggleSelectionMode);
+  $("#bulk-delete").addEventListener("click", bulkDelete);
+  $("#bulk-cancel").addEventListener("click", () => {
+    state.selectedJobs.clear();
+    state.selectionMode = false;
+    const btn = $("#history-select-toggle");
+    btn.classList.remove("active");
+    btn.querySelector("span:last-child").textContent = "Выбрать";
+    renderHistory();
+  });
+  $("#bulk-star").addEventListener("click", () => bulkStar(true));
+  $("#bulk-unstar").addEventListener("click", () => bulkStar(false));
 }
 
 function setupHistoryFilters() {
@@ -1157,13 +1592,6 @@ async function updateMonitor() {
       <div class="disk-info">${disk.free_gb} GB free / ${disk.total_gb} GB</div>
     </div>
   `).join("");
-
-  const pill = $("#gpu-pill");
-  if (d.gpu) {
-    pill.classList.add("ok"); pill.classList.remove("err");
-    pill.querySelector(".text").textContent =
-      `${d.gpu.name} · ${d.gpu.memory_used_gb}/${d.gpu.memory_total_gb} GB · ${d.gpu.utilization}%`;
-  }
 }
 
 function metricCard(title, value, sub, percent, history, extra) {
@@ -1256,6 +1684,8 @@ function setupNav() {
       if (v === "settings") loadSettings();
       if (v === "system") startMonitor();
       else stopMonitor();
+      if (v === "dashboard") startDashboardMonitor();
+      else stopDashboardMonitor();
       if (v === "history") refreshHistory();
     });
   });
@@ -1923,6 +2353,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupResultScroll();
   setupDetailModal();
   setupHistoryFilters();
+  setupBulkActions();
   await loadSystem();
 
   $("#start-btn").addEventListener("click", () => start(false));
@@ -1934,6 +2365,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#settings-save").addEventListener("click", saveSettings);
   $("#settings-reset").addEventListener("click", resetSettings);
   $("#history-refresh").addEventListener("click", refreshHistory);
+  $("#dashboard-refresh").addEventListener("click", loadDashboard);
 
   const hours = state.settings["server.retention_hours"] || 24;
   $("#retention-info").textContent = t("history.retention", { hours });

@@ -52,6 +52,17 @@
   "stage.interrupted": "Прервано",
   "stage.queued": "В очереди",
 
+  "nav.dashboard": "Дашборд",
+  "dashboard.title": "Дашборд",
+  "dashboard.total": "Всего задач",
+  "dashboard.active": "Активные",
+  "dashboard.audio": "Часов аудио",
+  "dashboard.rtf": "Средний RTF",
+  "dashboard.starred": "Избранных",
+  "dashboard.activity": "Активность за 30 дней",
+  "dashboard.top_models": "Топ моделей",
+  "dashboard.top_languages": "Топ языков",
+
   "result.title": "Результат",
   "result.empty": "Здесь появится распознанный текст",
   "result.empty_hint": "Загрузите файл и нажмите «Начать транскрибацию»",

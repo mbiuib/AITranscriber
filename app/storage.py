@@ -381,6 +381,40 @@ class JobRepository:
             cur.close()
             return affected > 0
 
+    def delete_many(self, job_ids: List[str]) -> List[str]:
+        """
+        Удаляет несколько задач одним запросом.
+
+        Логи и сегменты удаляются каскадом через ON DELETE CASCADE.
+        Отсутствующие ID молча игнорируются.
+
+        Args:
+            job_ids: Список идентификаторов задач.
+
+        Returns:
+            Список ID, которые были реально удалены (для очистки файлов
+            на диске вызывающей стороной).
+        """
+        if not job_ids:
+            return []
+
+        with self._lock:
+            cur = self._conn.cursor()
+            placeholders = ",".join("?" * len(job_ids))
+            cur.execute(
+                f"SELECT id FROM jobs WHERE id IN ({placeholders})",
+                job_ids,
+            )
+            existing = [row["id"] for row in cur.fetchall()]
+            if existing:
+                placeholders2 = ",".join("?" * len(existing))
+                cur.execute(
+                    f"DELETE FROM jobs WHERE id IN ({placeholders2})",
+                    existing,
+                )
+            cur.close()
+            return existing
+
     def mark_interrupted(self) -> int:
         """
         Помечает все незавершённые задачи как прерванные.
@@ -680,6 +714,121 @@ class JobRepository:
             cnt = cur.fetchone()["cnt"]
             cur.close()
             return cnt
+
+    def dashboard_stats(self) -> Dict[str, Any]:
+        """
+        Возвращает агрегированную статистику по всем задачам.
+
+        Один проход по данным: считает общее количество, разбивку по
+        статусам, суммарную длительность обработанного аудио, средний
+        RTF, топ моделей и языков, статистику по дням за 30 дней.
+
+        Returns:
+            Словарь с полями:
+                total (int): общее количество задач.
+                by_status (dict): {status: count}.
+                starred_count (int): количество избранных.
+                total_audio_seconds (float): суммарная длительность
+                    успешно обработанных записей.
+                total_processing_seconds (float): суммарное время
+                    обработки.
+                avg_rtf (float | None): средний real-time factor.
+                top_models (list): [{model, count}, ...] до 5.
+                top_languages (list): [{language, count}, ...] до 5.
+                by_day (list): [{date, count, done, error}, ...]
+                    за последние 30 дней.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+
+            cur.execute("SELECT COUNT(*) AS c FROM jobs")
+            total = cur.fetchone()["c"]
+
+            cur.execute("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status")
+            by_status = {r["status"]: r["c"] for r in cur.fetchall()}
+
+            cur.execute("SELECT COUNT(*) AS c FROM jobs WHERE starred = 1")
+            starred = cur.fetchone()["c"]
+
+            cur.execute("""
+                SELECT metadata, processing_stats FROM jobs
+                WHERE status = 'done' AND metadata != '{}'
+            """)
+            total_audio = 0.0
+            total_proc = 0.0
+            rtf_sum = 0.0
+            rtf_count = 0
+            lang_counter: Dict[str, int] = {}
+
+            for row in cur.fetchall():
+                try:
+                    meta = json.loads(row["metadata"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+
+                dur = meta.get("duration", 0) or 0
+                pt = meta.get("processing_time", 0) or 0
+                total_audio += dur
+                total_proc += pt
+
+                lang = meta.get("language")
+                if lang and lang != "?":
+                    lang_counter[lang] = lang_counter.get(lang, 0) + 1
+
+                try:
+                    st = json.loads(row["processing_stats"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    st = {}
+                if "rtf" in st:
+                    rtf_sum += st["rtf"]
+                    rtf_count += 1
+
+            cur.execute("""
+                SELECT model, COUNT(*) AS c FROM jobs
+                GROUP BY model ORDER BY c DESC LIMIT 5
+            """)
+            top_models = [{"model": r["model"], "count": r["c"]} for r in cur.fetchall()]
+
+            top_languages = [
+                {"language": k, "count": v}
+                for k, v in sorted(lang_counter.items(), key=lambda x: -x[1])[:5]
+            ]
+
+            cutoff = time.time() - 30 * 86400
+            cur.execute("""
+                SELECT
+                    CAST(created_at / 86400 AS INTEGER) * 86400 AS day_start,
+                    COUNT(*) AS c,
+                    SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_count,
+                    SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+                FROM jobs
+                WHERE created_at >= ?
+                GROUP BY day_start
+                ORDER BY day_start
+            """, (cutoff,))
+            by_day = [
+                {
+                    "date": r["day_start"],
+                    "count": r["c"],
+                    "done": r["done_count"],
+                    "error": r["error_count"],
+                }
+                for r in cur.fetchall()
+            ]
+
+            cur.close()
+
+        return {
+            "total": total,
+            "by_status": by_status,
+            "starred_count": starred,
+            "total_audio_seconds": round(total_audio, 1),
+            "total_processing_seconds": round(total_proc, 1),
+            "avg_rtf": round(rtf_sum / rtf_count, 3) if rtf_count else None,
+            "top_models": top_models,
+            "top_languages": top_languages,
+            "by_day": by_day,
+        }
 
     def close(self) -> None:
         """Закрывает соединение. Вызывается при остановке сервера."""

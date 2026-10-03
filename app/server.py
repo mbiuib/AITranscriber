@@ -215,6 +215,34 @@ async def system_resources() -> Dict[str, Any]:
     return monitor.snapshot(env.models_dir, env.upload_dir)
 
 
+@app.get("/api/dashboard", tags=["system"], summary="Агрегированная статистика")
+async def dashboard() -> Dict[str, Any]:
+    """
+    Возвращает агрегированную статистику для дашборда.
+
+    Объединяет данные из БД (количество задач, длительности, топ моделей)
+    и текущее состояние очереди.
+
+    Returns:
+        Словарь с полями из JobRepository.dashboard_stats() плюс
+        queue: {size, running, max_parallel}.
+    """
+    repo = get_repository()
+    stats = repo.dashboard_stats()
+
+    try:
+        tq = get_task_queue()
+        stats["queue"] = {
+            "size": tq.size(),
+            "running": tq.running_count(),
+            "max_parallel": tq.get_max_parallel(),
+        }
+    except RuntimeError:
+        stats["queue"] = {"size": 0, "running": 0, "max_parallel": 1}
+
+    return stats
+
+
 @app.get("/api/settings/schema", tags=["settings"], summary="Схема runtime-настроек")
 async def settings_schema() -> Dict[str, Any]:
     """
@@ -411,58 +439,38 @@ async def list_jobs(
     }
 
 
-@app.post(
-    "/api/jobs",
-    tags=["jobs"],
-    summary="Создать задачу транскрибации",
-    description="Принимает файл (multipart/form-data) и параметры обработки. "
-                "Возвращает ID задачи сразу; воркер запускается в фоне. "
-                "Если check_duplicate=True и файл уже обрабатывался ранее — "
-                "возвращает 409 с информацией о дубликате.",
-    responses={
-        200: {
-            "description": "Задача создана",
-            "content": {"application/json": {
-                "example": {"job_id": "a1b2c3d4e5f6", "status": "pending"}
-            }},
-        },
-        400: {"description": "Неподдерживаемый формат файла"},
-        409: {"description": "Найден идентичный файл (SHA-256 совпадает)"},
-        413: {"description": "Файл превышает лимит из настроек"},
-    },
-)
-async def create_job(
-    file: UploadFile = File(..., description="Аудио или видеофайл"),
-    model: Optional[str] = Form(None),
-    language: Optional[str] = Form(None),
-    check_duplicate: bool = Form(True, description="Проверять ли дубликат по SHA-256"),
+async def _save_and_create_job(
+    file: UploadFile,
+    model: str,
+    language: Optional[str],
+    check_duplicate: bool,
 ) -> Dict[str, Any]:
     """
-    Создаёт новую задачу транскрибации.
+    Сохраняет файл на диск и создаёт задачу.
 
-    После сохранения файла считается его SHA-256 хеш — параллельно с
-    записью на диск, в одном проходе. Если check_duplicate=True и в БД
-    есть завершённая задача с тем же хешем, файл удаляется, а клиент
-    получает 409 Conflict с объектом duplicate_of.
+    Общий код для одиночной и batch-загрузки. При ошибке файл удаляется,
+    задача снимается с учёта. Возвращает словарь одного из видов:
+
+        {"status": "created", "job_id": "...", "filename": "..."}
+        {"status": "duplicate", "filename": "...", "duplicate_of": {...}}
+        {"status": "error", "filename": "...", "message": "..."}
 
     Args:
-        file: Загруженный файл (multipart/form-data).
-        model: Название модели Whisper. None — значение из настроек.
-        language: Код языка или "auto".
-        check_duplicate: Если True и найден дубликат — вернуть 409.
+        file: Загруженный файл.
+        model: Название модели Whisper.
+        language: Код языка или None для авто.
+        check_duplicate: Проверять ли дубликат по SHA-256.
 
     Returns:
-        Словарь {"job_id": "...", "status": "pending"}.
-
-    Raises:
-        HTTPException: 400 — неподдерживаемый формат;
-            409 — найден дубликат (detail содержит duplicate_of);
-            413 — файл превышает лимит;
-            500 — ошибка сохранения.
+        Словарь с результатом обработки одного файла.
     """
     ext = Path(file.filename).suffix.lower()
     if ext not in transcribe.ALL_SUPPORTED:
-        raise HTTPException(400, f"Неподдерживаемый формат: {ext}")
+        return {
+            "status": "error",
+            "filename": file.filename,
+            "message": f"Неподдерживаемый формат: {ext}",
+        }
 
     max_mb = int(store.get("server.max_upload_mb"))
     max_bytes = max_mb * 1024 * 1024
@@ -474,15 +482,18 @@ async def create_job(
         filename=file.filename,
         file_path="",
         file_size=0,
-        model=model or store.get("transcription.model"),
-        language=None if (language in (None, "auto", "")) else language,
+        model=model,
+        language=language,
     )
     job.set_loop(asyncio.get_running_loop())
 
     file_path = env.upload_dir / f"{job.id}{ext}"
     job.file_path = str(file_path)
     if jm._repo:
-        jm._repo.update_job(job.id, file_path=str(file_path))
+        try:
+            jm._repo.update_job(job.id, file_path=str(file_path))
+        except Exception:
+            pass
 
     size = 0
     hasher = hashlib.sha256()
@@ -494,16 +505,22 @@ async def create_job(
                     f.close()
                     file_path.unlink(missing_ok=True)
                     jm.delete(job.id)
-                    raise HTTPException(413, f"Файл превышает лимит {max_mb} МБ")
+                    return {
+                        "status": "error",
+                        "filename": file.filename,
+                        "message": f"Файл превышает лимит {max_mb} МБ",
+                    }
                 f.write(chunk)
                 hasher.update(chunk)
         job.file_size = size
-    except HTTPException:
-        raise
     except Exception as e:
         file_path.unlink(missing_ok=True)
         jm.delete(job.id)
-        raise HTTPException(500, f"Ошибка сохранения: {e}")
+        return {
+            "status": "error",
+            "filename": file.filename,
+            "message": f"Ошибка сохранения: {e}",
+        }
 
     file_hash = hasher.hexdigest()
     if jm._repo:
@@ -517,19 +534,146 @@ async def create_job(
         if existing:
             file_path.unlink(missing_ok=True)
             jm.delete(job.id)
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "Найден идентичный файл",
-                    "duplicate_of": existing,
-                },
-            )
+            return {
+                "status": "duplicate",
+                "filename": file.filename,
+                "duplicate_of": existing,
+            }
 
     job.set_status("queued", "В очереди")
     job.log("info", f"Задача {job.id} создана: {file.filename} ({size / 1024 / 1024:.1f} МБ)")
     get_task_queue().put(job.id)
 
-    return {"job_id": job.id, "status": "queued"}
+    return {
+        "status": "created",
+        "job_id": job.id,
+        "filename": file.filename,
+        "file_size": size,
+    }
+
+
+@app.post(
+    "/api/jobs",
+    tags=["jobs"],
+    summary="Создать задачу транскрибации",
+    responses={
+        200: {"description": "Задача создана"},
+        400: {"description": "Неподдерживаемый формат"},
+        409: {"description": "Найден дубликат"},
+        413: {"description": "Файл превышает лимит"},
+    },
+)
+async def create_job(
+    file: UploadFile = File(..., description="Аудио или видеофайл"),
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    check_duplicate: bool = Form(True),
+) -> Dict[str, Any]:
+    """
+    Создаёт одну задачу транскрибации.
+
+    Args:
+        file: Загруженный файл.
+        model: Название модели Whisper.
+        language: Код языка или "auto".
+        check_duplicate: Если True и найден дубликат — 409.
+
+    Returns:
+        {"job_id": "...", "status": "queued"}.
+
+    Raises:
+        HTTPException: 400 — неподдерживаемый формат;
+            409 — дубликат (detail содержит duplicate_of);
+            413 — превышен лимит;
+            500 — ошибка сохранения.
+    """
+    model = model or store.get("transcription.model")
+    language = None if (language in (None, "auto", "")) else language
+
+    result = await _save_and_create_job(file, model, language, check_duplicate)
+
+    if result["status"] == "created":
+        return {"job_id": result["job_id"], "status": "queued"}
+    if result["status"] == "duplicate":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Найден идентичный файл",
+                "duplicate_of": result["duplicate_of"],
+            },
+        )
+    raise HTTPException(400, result.get("message", "Ошибка создания задачи"))
+
+
+@app.post(
+    "/api/jobs/batch",
+    tags=["jobs"],
+    summary="Создать несколько задач за один запрос",
+    description="Принимает список файлов. Каждый обрабатывается независимо: "
+                "ошибка или дубликат на одном не валит остальные. Результат "
+                "содержит массив по каждому файлу и сводку.",
+)
+async def create_jobs_batch(
+    files: List[UploadFile] = File(..., description="Список файлов"),
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    check_duplicate: bool = Form(True),
+) -> Dict[str, Any]:
+    """
+    Создаёт несколько задач за один запрос.
+
+    Обрабатывает файлы последовательно, чтобы не перегружать диск
+    параллельными записями. Задачи попадают в очередь по мере создания.
+
+    Args:
+        files: Список загруженных файлов.
+        model: Название модели для всех задач.
+        language: Код языка или "auto" для всех задач.
+        check_duplicate: Проверять ли дубликаты по SHA-256.
+
+    Returns:
+        Словарь {"results": [...], "summary": {created, duplicates, errors}}.
+
+    Raises:
+        HTTPException: 400 — если список пуст.
+    """
+    if not files:
+        raise HTTPException(400, "Список файлов пуст")
+
+    model = model or store.get("transcription.model")
+    language = None if (language in (None, "auto", "")) else language
+
+    results: List[Dict[str, Any]] = []
+    created = duplicates = errors = 0
+
+    for idx, f in enumerate(files):
+        try:
+            r = await _save_and_create_job(f, model, language, check_duplicate)
+        except Exception as e:
+            r = {
+                "status": "error",
+                "filename": f.filename,
+                "message": f"{type(e).__name__}: {e}",
+            }
+        r["index"] = idx
+        results.append(r)
+
+        if r["status"] == "created":
+            created += 1
+        elif r["status"] == "duplicate":
+            duplicates += 1
+        else:
+            errors += 1
+
+    return {
+        "results": results,
+        "summary": {
+            "total": len(files),
+            "created": created,
+            "duplicates": duplicates,
+            "errors": errors,
+        },
+    }
 
 
 @app.patch(
@@ -724,6 +868,47 @@ async def delete_job(job_id: str) -> Dict[str, bool]:
     if not ok:
         raise HTTPException(404, "Задача не найдена")
     return {"ok": True}
+
+
+@app.post(
+    "/api/jobs/batch/delete",
+    tags=["jobs"],
+    summary="Массовое удаление задач",
+    description="Принимает список ID задач и удаляет их вместе с файлами. "
+                "Отсутствующие ID игнорируются.",
+)
+async def delete_jobs_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Удаляет несколько задач за один запрос.
+
+    Args:
+        payload: {"ids": ["id1", "id2", ...]}.
+
+    Returns:
+        Словарь {"deleted": int, "not_found": [...], "files_removed": int}.
+
+    Raises:
+        HTTPException: 400 — некорректный payload или пустой список;
+            413 — слишком много ID за раз (>1000).
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Ожидается JSON-объект")
+
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "Ожидается непустой массив 'ids'")
+
+    if len(ids) > 1000:
+        raise HTTPException(413, "За раз можно удалить не более 1000 задач")
+
+    ids = [str(x) for x in ids if x]
+
+    tq = get_task_queue()
+    for jid in ids:
+        tq.remove(jid)
+
+    result = get_job_manager().delete_many(ids, remove_files=True)
+    return result
 
 
 @app.get("/api/queue", tags=["jobs"], summary="Состояние очереди")

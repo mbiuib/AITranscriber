@@ -27,6 +27,10 @@
         <span class="nav-icon material-symbols-rounded">auto_awesome</span>
         <span data-i18n="nav.new">Новая задача</span>
       </button>
+      <button class="nav-item" data-view="dashboard">
+        <span class="nav-icon material-symbols-rounded">dashboard</span>
+        <span>Дашборд</span>
+      </button>
       <button class="nav-item" data-view="history">
         <span class="nav-icon material-symbols-rounded">history</span>
         <span data-i18n="nav.history">История</span>
@@ -42,12 +46,28 @@
       </button>
     </nav>
 
-    <div class="queue-indicator" id="queue-indicator" hidden>
-      <span class="material-symbols-rounded">schedule</span>
-      <span class="queue-text">
-        <span class="queue-running">0</span> из <span class="queue-max">1</span> активно
-        · <span class="queue-size">0</span> в очереди
-      </span>
+    <div class="mini-dash" id="mini-dash">
+      <div class="mini-dash-title">
+        <span class="material-symbols-rounded">bolt</span>
+        <span>Очередь</span>
+      </div>
+      <div class="mini-dash-body">
+        <div class="mini-dash-row">
+          <span class="mini-dash-label">Активно</span>
+          <span class="mini-dash-value" id="mini-running">0</span>
+        </div>
+        <div class="mini-dash-row">
+          <span class="mini-dash-label">Ждёт</span>
+          <span class="mini-dash-value" id="mini-queued">0</span>
+        </div>
+        <div class="mini-dash-row">
+          <span class="mini-dash-label">Лимит</span>
+          <span class="mini-dash-value" id="mini-max">1</span>
+        </div>
+        <div class="mini-dash-bar">
+          <div class="mini-dash-fill" id="mini-fill"></div>
+        </div>
+      </div>
     </div>
 
     <div class="sidebar-footer">
@@ -83,7 +103,7 @@
       </div>
       <div class="gpu-info" id="gpu-info">
         <span class="dot"></span>
-        <span class="text">…</span>
+        <span class="text">Проверка GPU…</span>
       </div>
     </header>
 
@@ -91,12 +111,6 @@
     <section class="view active" data-view="new">
       <header class="view-header">
         <h1 data-i18n="upload.title">Новая транскрибация</h1>
-        <div class="header-actions">
-          <div class="gpu-pill" id="gpu-pill">
-            <span class="dot"></span>
-            <span class="text">…</span>
-          </div>
-        </div>
       </header>
 
       <div class="view-body">
@@ -105,21 +119,22 @@
           <div class="col-left">
             <div class="card">
               <div class="dropzone" id="dropzone">
-                <input type="file" id="file-input" hidden
+                <input type="file" id="file-input" hidden multiple
                        accept="audio/*,video/*,.m4a,.mkv,.webm,.mp4,.mp3,.wav,.flac">
                 <div class="dropzone-inner">
                   <div class="dropzone-icon material-symbols-rounded">upload_file</div>
-                  <div class="dropzone-title" data-i18n="upload.drop">Перетащите файл сюда</div>
-                  <div class="dropzone-hint" data-i18n="upload.hint">или нажмите для выбора</div>
-                  <div class="dropzone-formats" data-i18n="upload.formats">MP4 · MKV · M4A · MP3 · WAV</div>
+                  <div class="dropzone-title">Перетащите файлы сюда</div>
+                  <div class="dropzone-hint">или нажмите для выбора · можно несколько сразу</div>
+                  <div class="dropzone-formats">MP4 · MKV · M4A · MP3 · WAV</div>
                 </div>
               </div>
 
-              <div class="file-chip" id="file-chip" hidden>
-                <span class="chip-icon material-symbols-rounded">attach_file</span>
-                <span class="chip-name" id="chip-name"></span>
-                <span class="chip-size" id="chip-size"></span>
-                <button class="chip-remove material-symbols-rounded" id="chip-remove" title="Убрать">close</button>
+              <div class="file-list" id="file-list" hidden>
+                <div class="file-list-header">
+                  <span class="file-list-count" id="file-list-count">0 файлов</span>
+                  <button class="btn-mini" id="file-list-clear">Очистить все</button>
+                </div>
+                <div class="file-list-items" id="file-list-items"></div>
               </div>
 
               <div class="quick-options" id="quick-options"></div>
@@ -188,12 +203,47 @@
       </div>
     </section>
 
+    <!-- ---- View: Dashboard ---- -->
+    <section class="view" data-view="dashboard">
+      <header class="view-header">
+        <h1>Дашборд</h1>
+        <div class="header-actions">
+          <span class="muted" id="dashboard-updated"></span>
+          <button class="btn btn-ghost" id="dashboard-refresh">
+            <span class="material-symbols-rounded">refresh</span>
+            Обновить
+          </button>
+        </div>
+      </header>
+      <div class="view-body">
+        <div class="dash-kpi-grid" id="dash-kpi-grid"></div>
+        <div class="dash-chart-card">
+          <div class="card-header"><h2>Активность за 30 дней</h2></div>
+          <div id="dash-chart" class="dash-chart"></div>
+        </div>
+        <div class="dash-split">
+          <div class="card">
+            <div class="card-header"><h2>Топ моделей</h2></div>
+            <div id="dash-top-models" class="dash-list"></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2>Топ языков</h2></div>
+            <div id="dash-top-languages" class="dash-list"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- ---- View: History ---- -->
     <section class="view" data-view="history">
       <header class="view-header">
         <h1 data-i18n="history.title">История задач</h1>
         <div class="header-actions">
           <span class="muted" id="retention-info"></span>
+          <button class="btn btn-ghost" id="history-select-toggle">
+            <span class="material-symbols-rounded">checklist</span>
+            <span>Выбрать</span>
+          </button>
           <button class="btn btn-ghost" id="history-refresh">
             <span class="material-symbols-rounded">refresh</span>
             <span data-i18n="action.refresh">Обновить</span>
@@ -202,6 +252,29 @@
       </header>
       <div class="view-body">
         <div class="card">
+          <div class="bulk-actions" id="bulk-actions" hidden>
+            <div class="bulk-info">
+              <span class="bulk-count" id="bulk-count">0</span>
+              <span class="bulk-label">выбрано</span>
+            </div>
+            <div class="bulk-buttons">
+              <button class="btn btn-ghost" id="bulk-star">
+                <span class="material-symbols-rounded">star</span>
+                <span>В избранное</span>
+              </button>
+              <button class="btn btn-ghost" id="bulk-unstar">
+                <span class="material-symbols-rounded">star_border</span>
+                <span>Убрать из избранного</span>
+              </button>
+              <button class="btn btn-ghost" id="bulk-cancel">
+                <span>Отмена</span>
+              </button>
+              <button class="btn btn-danger" id="bulk-delete">
+                <span class="material-symbols-rounded">delete</span>
+                <span>Удалить</span>
+              </button>
+            </div>
+          </div>
           <div class="history-filters">
             <div class="filter-search">
               <span class="material-symbols-rounded">search</span>

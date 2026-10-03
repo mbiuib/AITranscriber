@@ -99,10 +99,12 @@ async function setTheme(theme) {
 /* ============================================================
    Toasts
    ============================================================ */
-function toast(kind, icon, text, timeout = 3500) {
+function toast(kind, iconName, text, timeout = 3500) {
   const el = document.createElement("div");
   el.className = "toast " + kind;
-  el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-text"></span>`;
+  el.innerHTML =
+    `<span class="toast-icon material-symbols-rounded">${iconName}</span>` +
+    `<span class="toast-text"></span>`;
   el.querySelector(".toast-text").textContent = text;
   $("#toasts").appendChild(el);
   setTimeout(() => {
@@ -322,14 +324,14 @@ function createNumberInput(value, { min, max, step = 1, id, onChange } = {}) {
 
   const up = document.createElement("button");
   up.type = "button";
-  up.className = "stepper up";
-  up.textContent = "▲";
+  up.className = "stepper up material-symbols-rounded";
+  up.textContent = "keyboard_arrow_up";
   up.tabIndex = -1;
 
   const down = document.createElement("button");
   down.type = "button";
-  down.className = "stepper down";
-  down.textContent = "▼";
+  down.className = "stepper down material-symbols-rounded";
+  down.textContent = "keyboard_arrow_down";
   down.tabIndex = -1;
 
   const clamp = (v) => {
@@ -369,7 +371,7 @@ function createNumberInput(value, { min, max, step = 1, id, onChange } = {}) {
 async function saveSettings() {
   const values = { ...state.settingsDirty };
   if (!Object.keys(values).length) {
-    toast("info", "ℹ️", "Нет изменений");
+    toast("info", "info", "Нет изменений");
     return;
   }
   const r = await fetch("/api/settings", {
@@ -379,7 +381,7 @@ async function saveSettings() {
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
-    toast("error", "❌", err.detail || "Ошибка сохранения");
+    toast("error", "error", err.detail || "Ошибка сохранения");
     return;
   }
   const d = await r.json();
@@ -387,7 +389,7 @@ async function saveSettings() {
   state.settingsDirty = {};
   renderSettingsForm();
   applyQuickOptions();
-  toast("success", "✅", t("toast.settings_saved"));
+  toast("success", "check_circle", t("toast.settings_saved"));
 }
 
 async function resetSettings() {
@@ -398,7 +400,7 @@ async function resetSettings() {
   state.settingsDirty = {};
   renderSettingsForm();
   applyQuickOptions();
-  toast("success", "🔄", t("toast.settings_reset"));
+  toast("success", "refresh", t("toast.settings_reset"));
 }
 
 /* ============================================================
@@ -416,6 +418,11 @@ function getSavedJobId() {
 
 /**
  * Восстанавливает активную задачу после перезагрузки страницы.
+ *
+ * Сначала проверяет ID из localStorage. Если его нет — ищет любую
+ * активную задачу через /api/jobs. Для активной задачи восстанавливает
+ * снимок и подписывается на SSE, для завершённой — показывает финал
+ * без подписки.
  */
 async function restoreActiveJob() {
   let jobId = getSavedJobId();
@@ -464,14 +471,14 @@ async function restoreActiveJob() {
     $("#cancel-btn").disabled = false;
     ensureConsoleOpen();
     subscribe(snap.id);
-    toast("info", "🔄", "Восстановлено: задача выполняется");
+    toast("info", "refresh", "Восстановлено: задача выполняется");
   } else {
     if (snap.status === "done") {
-      toast("success", "✅", "Восстановлен результат");
+      toast("success", "check_circle", "Восстановлен результат");
     } else if (snap.status === "error") {
-      toast("error", "❌", "Задача завершилась с ошибкой");
+      toast("error", "error", "Задача завершилась с ошибкой");
     } else if (snap.status === "cancelled") {
-      toast("warn", "⏹", "Задача была отменена");
+      toast("warn", "stop_circle", "Задача была отменена");
     }
     clearActiveJob();
   }
@@ -554,11 +561,11 @@ async function start() {
     const d = await r.json();
     state.jobId = d.job_id;
     saveActiveJob(d.job_id);
-    toast("success", "✅", t("toast.job_created"));
+    toast("success", "check_circle", t("toast.job_created"));
     subscribe(d.job_id);
     refreshHistory();
   } catch (e) {
-    toast("error", "❌", e.message);
+    toast("error", "error", e.message);
     state.running = false;
     $("#start-btn").disabled = false;
     $("#cancel-btn").disabled = true;
@@ -568,7 +575,7 @@ async function start() {
 async function cancelJob() {
   if (!state.jobId) return;
   await fetch(`/api/jobs/${state.jobId}/cancel`, { method: "POST" });
-  toast("warn", "⏹", t("toast.cancelled"));
+  toast("warn", "stop_circle", t("toast.cancelled"));
 }
 
 /* ============================================================
@@ -775,7 +782,7 @@ function onDone(text, metadata) {
     speed: speed.toFixed(2),
   });
 
-  toast("success", "🎉", t("toast.done"));
+  toast("success", "celebration", t("toast.done"));
   if (navigator.vibrate) navigator.vibrate([50, 30, 50]);
   state.es?.close();
   refreshHistory();
@@ -787,7 +794,7 @@ function onError(msg) {
   $("#start-btn").disabled = !state.file;
   $("#cancel-btn").disabled = true;
   $("#progress-fill").classList.remove("active");
-  toast("error", "❌", msg.slice(0, 140), 6000);
+  toast("error", "error", msg.slice(0, 140), 6000);
   if (navigator.vibrate) navigator.vibrate(100);
   state.es?.close();
   refreshHistory();
@@ -799,7 +806,7 @@ function onCancelled() {
   $("#start-btn").disabled = !state.file;
   $("#cancel-btn").disabled = true;
   $("#progress-fill").classList.remove("active");
-  toast("warn", "⏹", t("toast.cancelled"));
+  toast("warn", "stop_circle", t("toast.cancelled"));
   state.es?.close();
 }
 
@@ -814,7 +821,7 @@ function resetResult() {
   $("#result-stats").hidden = true;
   $("#result-content").innerHTML = `
     <div class="empty-state">
-      <div class="empty-icon">⏳</div>
+      <div class="empty-icon material-symbols-rounded">hourglass_top</div>
       <div class="empty-text">${t("common.loading")}</div>
     </div>`;
   updateProgress(0, "", "pending");
@@ -831,7 +838,7 @@ async function copyText() {
   if (!state.segments.length) return;
   const txt = state.segments.map(s => s.text).join("\n");
   await navigator.clipboard.writeText(txt);
-  toast("success", "📋", t("toast.copied"));
+  toast("success", "content_copy", t("toast.copied"));
 }
 
 function downloadTxt() {
@@ -873,7 +880,7 @@ function downloadBlob(content, name, mime) {
   const a = document.createElement("a");
   a.href = url; a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  toast("success", "💾", t("toast.saved", { name }));
+  toast("success", "save", t("toast.saved", { name }));
 }
 
 /* ============================================================
@@ -899,7 +906,7 @@ function renderHistory() {
   if (!state.jobs.length) {
     list.innerHTML = `
       <div class="empty-state">
-        <div class="empty-icon">📚</div>
+        <div class="empty-icon material-symbols-rounded">history_toggle_off</div>
         <div class="empty-text">${t("history.empty")}</div>
       </div>`;
     return;
@@ -911,20 +918,24 @@ function renderHistory() {
     const created = new Date(j.created_at * 1000).toLocaleString("ru-RU");
     const dur = j.duration ? formatTs(j.duration) : "—";
     item.innerHTML = `
-      <div class="history-icon">🎬</div>
+      <div class="history-icon">
+        <span class="material-symbols-rounded">movie</span>
+      </div>
       <div class="history-main">
         <div class="history-name"></div>
         <div class="history-meta">${created} · ${j.model} · ${dur} · ${j.segments_count} сегм.</div>
       </div>
       <div class="history-status ${j.status}">${t("stage." + j.status) || j.status}</div>
-      <button class="btn-icon" data-action="delete" title="Удалить">🗑️</button>
+      <button class="btn-icon" data-action="delete" title="Удалить">
+        <span class="material-symbols-rounded">delete</span>
+      </button>
     `;
     item.querySelector(".history-name").textContent = j.filename;
     item.querySelector('[data-action="delete"]').addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!confirm(t("history.delete_confirm"))) return;
       await fetch(`/api/jobs/${j.id}`, { method: "DELETE" });
-      toast("success", "🗑️", t("toast.job_deleted"));
+      toast("success", "delete", t("toast.job_deleted"));
       refreshHistory();
     });
     list.appendChild(item);
@@ -1026,15 +1037,21 @@ function renderSparkline(data) {
 /* ============================================================
    Console
    ============================================================ */
+function updateConsoleChevron() {
+  const ch = $("#console-chevron");
+  ch.textContent = state.consoleOpen ? "keyboard_arrow_down" : "keyboard_arrow_up";
+  ch.classList.toggle("rotated", !state.consoleOpen);
+}
+
 function setupConsole() {
   document.body.classList.toggle("console-open", state.consoleOpen);
-  $("#console-chevron").textContent = state.consoleOpen ? "▼" : "▲";
+  updateConsoleChevron();
 
   $("#console-toggle").addEventListener("click", e => {
     if (e.target.closest("button")) return;
     state.consoleOpen = !state.consoleOpen;
     document.body.classList.toggle("console-open", state.consoleOpen);
-    $("#console-chevron").textContent = state.consoleOpen ? "▼" : "▲";
+    updateConsoleChevron();
   });
 
   $("#console-clear").addEventListener("click", e => {
@@ -1053,7 +1070,7 @@ function setupConsole() {
       `${l.querySelector(".log-message").textContent}`
     ).join("\n");
     await navigator.clipboard.writeText(lines);
-    toast("success", "📋", t("toast.copied"));
+    toast("success", "content_copy", t("toast.copied"));
   });
 }
 
@@ -1061,7 +1078,7 @@ function ensureConsoleOpen() {
   if (!state.consoleOpen) {
     state.consoleOpen = true;
     document.body.classList.add("console-open");
-    $("#console-chevron").textContent = "▼";
+    updateConsoleChevron();
   }
 }
 

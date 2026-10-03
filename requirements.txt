@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+python-dotenv
+faster-whisper
+moviepy
+huggingface_hub
+hf_transfer
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12

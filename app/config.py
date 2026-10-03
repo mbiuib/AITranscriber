@@ -18,6 +18,13 @@ BASE_DIR = Path(__file__).parent.parent
 
 
 RUNTIME_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "transcription.engine": {
+        "type": "select",
+        "options": ["whisper", "moss"],
+        "label": "Движок транскрибации", "group": "transcription", "order": 0,
+        "hint": "whisper — Whisper + Pyannote (раздельно). "
+                "moss — MOSS-Transcribe-Diarize (end-to-end).",
+    },
     "transcription.model": {
         "type": "select",
         "options": ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"],
@@ -158,6 +165,8 @@ class EnvSettings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    default_engine: str = "whisper"
 
     hf_token: str = ""
     hf_transfer: bool = True
@@ -331,6 +340,7 @@ class SettingsStore:
         """
         env = self._env
         mapping = {
+            "transcription.engine": env.default_engine,
             "transcription.model": env.default_model,
             "transcription.language": env.default_language,
             "transcription.batch_size": env.default_batch_size,
@@ -440,6 +450,7 @@ class SettingsStore:
             initial_prompt, hotwords, diarization, min_speakers, max_speakers.
         """
         return {
+            "engine": self.get("transcription.engine"),
             "model": self.get("transcription.model"),
             "language": self.get("transcription.language"),
             "batch_size": self.get("transcription.batch_size"),

@@ -26,7 +26,7 @@ from typing import Any, Dict, List
 
 from .config import get_env, get_store
 from .jobs import Job
-from . import media_info, diarization
+from . import media_info, diarization, moss_transcribe
 
 SUPPORTED_AUDIO = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".wma", ".aac", ".opus"}
 SUPPORTED_VIDEO = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".ts"}
@@ -267,8 +267,30 @@ def _extract_audio(job: Job, video_path: str) -> str:
     job.log("success", "Аудио извлечено: 16 кГц, моно")
     return audio_path
 
-
 def run(job: Job) -> None:
+    """
+    Диспетчер транскрибации.
+
+    Выбирает движок на основе настройки transcription.engine:
+    whisper — Whisper + Pyannote (текущий пайплайн);
+    moss — MOSS-Transcribe-Diarize (end-to-end).
+
+    Args:
+        job: Задача со всеми параметрами обработки.
+    """
+    settings = get_store().as_dict_for_worker()
+    engine = settings.get("engine") or "whisper"
+
+    if engine == "moss":
+        if not moss_transcribe.is_available():
+            job.log("warn", "MOSS не установлен, откат на Whisper + Pyannote")
+            _run_whisper(job)
+        else:
+            moss_transcribe.run(job)
+    else:
+        _run_whisper(job)
+
+def _run_whisper(job: Job) -> None:
     """
     Выполняет полный цикл транскрибации задачи.
 
